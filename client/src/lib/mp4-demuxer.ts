@@ -272,6 +272,7 @@ export class MP4Demuxer {
     this.file?.setExtractionOptions(track.id, undefined, {
       nbSamples: 100,
     });
+    this.file?.seek(0, true);
     this.file?.start();
   }
 
