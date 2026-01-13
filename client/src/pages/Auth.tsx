@@ -11,7 +11,9 @@ export default function Auth() {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [qrCodeUrl, setQrCodeUrl] = useState<string | null>(null);
   const [isPolling, setIsPolling] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const hasGeneratedToken = useRef(false);
+  const utils = trpc.useUtils();
 
   // Generate auth token
   const generateTokenMutation = trpc.auth.generateAuthToken.useMutation({
@@ -46,24 +48,46 @@ export default function Auth() {
 
   // Login mutation to set session cookie
   const loginMutation = trpc.auth.loginWithTelegram.useMutation({
-    onSuccess: () => {
-      // Session cookie set, redirect to home
-      setLocation("/");
+    onSuccess: async () => {
+      // Session cookie set, now invalidate the auth cache and wait for it to confirm
+      // This prevents the race condition where we redirect before the session is recognized
+      try {
+        // Invalidate the auth.me cache so it refetches with the new cookie
+        await utils.auth.me.invalidate();
+        // Refetch to confirm the session is valid
+        const result = await utils.auth.me.fetch();
+        if (result) {
+          // Session confirmed, safe to redirect
+          setLocation("/");
+        } else {
+          // Session not confirmed, try again
+          console.error("Session not confirmed after login");
+          setIsLoggingIn(false);
+          setIsPolling(true);
+        }
+      } catch (error) {
+        console.error("Error confirming session:", error);
+        setIsLoggingIn(false);
+        setIsPolling(true);
+      }
     },
     onError: (error) => {
       console.error("Login failed:", error);
+      setIsLoggingIn(false);
       setIsPolling(false);
     },
   });
 
   // Check if authenticated
   useEffect(() => {
-    if (authStatus?.verified && authStatus.userId && authToken) {
+    if (authStatus?.verified && authStatus.userId && authToken && !isLoggingIn) {
       // Stop polling and call login to set session cookie
+      // Set isLoggingIn to prevent multiple login attempts
       setIsPolling(false);
+      setIsLoggingIn(true);
       loginMutation.mutate({ authToken });
     }
-  }, [authStatus, authToken]);
+  }, [authStatus, authToken, isLoggingIn]);
 
   // Generate token on mount (only once)
   useEffect(() => {
@@ -142,10 +166,17 @@ export default function Auth() {
               </div>
             )}
 
-            {authStatus?.verified && (
+            {authStatus?.verified && !isLoggingIn && (
               <div className="flex items-center justify-center gap-2 text-primary">
                 <CheckCircle2 className="w-5 h-5" />
-                <span>Authentication successful! Redirecting...</span>
+                <span>Authentication successful! Setting up session...</span>
+              </div>
+            )}
+
+            {isLoggingIn && (
+              <div className="flex items-center justify-center gap-2 text-primary">
+                <Loader2 className="w-5 h-5 animate-spin" />
+                <span>Setting up your session... Please wait...</span>
               </div>
             )}
           </div>
