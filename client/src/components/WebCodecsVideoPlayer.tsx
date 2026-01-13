@@ -36,6 +36,17 @@ interface PlayerState {
   buffering: boolean;
 }
 
+interface DebugState {
+  videoDecoderState: string;
+  audioDecoderState: string;
+  frameBufferSize: number;
+  audioBufferSize: number;
+  chunksDecoded: number;
+  framesRendered: number;
+  lastError: string | null;
+  demuxerReady: boolean;
+}
+
 const FRAME_BUFFER_TARGET_SIZE = 3;
 const AUDIO_BUFFER_DURATION = 0.5;
 
@@ -55,6 +66,19 @@ export function WebCodecsVideoPlayer({
     isMuted: false,
     buffering: false,
   });
+  const [debugState, setDebugState] = useState<DebugState>({
+    videoDecoderState: "unconfigured",
+    audioDecoderState: "unconfigured",
+    frameBufferSize: 0,
+    audioBufferSize: 0,
+    chunksDecoded: 0,
+    framesRendered: 0,
+    lastError: null,
+    demuxerReady: false,
+  });
+  const [showDebug, setShowDebug] = useState(true);
+  const chunksDecodedRef = useRef(0);
+  const framesRenderedRef = useRef(0);
 
   const videoDemuxerRef = useRef<MP4Demuxer | null>(null);
   const audioDemuxerRef = useRef<MP4Demuxer | null>(null);
@@ -76,6 +100,10 @@ export function WebCodecsVideoPlayer({
 
   const updateState = useCallback((updates: Partial<PlayerState>) => {
     setState((prev) => ({ ...prev, ...updates }));
+  }, []);
+
+  const updateDebugState = useCallback((updates: Partial<DebugState>) => {
+    setDebugState((prev) => ({ ...prev, ...updates }));
   }, []);
 
   const initializePlayer = useCallback(async () => {
@@ -113,13 +141,17 @@ export function WebCodecsVideoPlayer({
       canvas.width = videoConfig.codedWidth;
       canvas.height = videoConfig.codedHeight;
 
+      updateDebugState({ demuxerReady: true });
+
       videoDecoderRef.current = new VideoDecoder({
         output: (frame: VideoFrame) => {
           frameBufferRef.current.push(frame);
+          updateDebugState({ frameBufferSize: frameBufferRef.current.length });
         },
         error: (e: Error) => {
           console.error("VideoDecoder error:", e);
           updateState({ error: `Video decode error: ${e.message}` });
+          updateDebugState({ lastError: `VideoDecoder: ${e.message}` });
         },
       });
 
@@ -140,6 +172,7 @@ export function WebCodecsVideoPlayer({
         codedHeight: videoConfig.codedHeight,
         description: videoConfig.description,
       });
+      updateDebugState({ videoDecoderState: "configured" });
 
       try {
         audioDemuxerRef.current = new MP4Demuxer(videoUrl);
@@ -183,9 +216,11 @@ export function WebCodecsVideoPlayer({
               numberOfChannels: audioConfig.numberOfChannels,
               description: audioConfig.description,
             });
+            updateDebugState({ audioDecoderState: "configured" });
           } else {
             console.warn("Audio codec not supported, playing without audio");
             audioDecoderRef.current = null;
+            updateDebugState({ audioDecoderState: "not supported" });
           }
         }
       } catch (audioError) {
@@ -260,7 +295,10 @@ export function WebCodecsVideoPlayer({
     if (isCleanedUpRef.current) return;
     if (frameBufferRef.current.length >= FRAME_BUFFER_TARGET_SIZE) return;
     if (!videoDemuxerRef.current || !videoDecoderRef.current) return;
-    if (videoDecoderRef.current.state === "closed") return;
+    if (videoDecoderRef.current.state === "closed") {
+      updateDebugState({ videoDecoderState: "closed" });
+      return;
+    }
 
     fillInProgressRef.current = true;
 
@@ -278,13 +316,17 @@ export function WebCodecsVideoPlayer({
 
         videoDecoderRef.current.decode(chunk as EncodedVideoChunk);
         chunksDecoded++;
+        chunksDecodedRef.current++;
       }
+
+      updateDebugState({ chunksDecoded: chunksDecodedRef.current });
 
       if (chunksDecoded > 0 && videoDecoderRef.current && videoDecoderRef.current.state !== "closed") {
         await videoDecoderRef.current.flush();
       }
     } catch (err) {
       console.error("Error filling frame buffer:", err);
+      updateDebugState({ lastError: `fillFrameBuffer: ${err instanceof Error ? err.message : String(err)}` });
     }
 
     fillInProgressRef.current = false;
@@ -292,7 +334,7 @@ export function WebCodecsVideoPlayer({
     if (!isCleanedUpRef.current && frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
       setTimeout(() => fillFrameBuffer(), 0);
     }
-  }, []);
+  }, [updateDebugState]);
 
   const fillAudioBuffer = useCallback(async () => {
     if (audioFillInProgressRef.current) return;
@@ -374,18 +416,24 @@ export function WebCodecsVideoPlayer({
 
     if (frame) {
       ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      framesRenderedRef.current++;
 
       const currentTimeSeconds = frame.timestamp / 1_000_000;
       updateState({ currentTime: currentTimeSeconds, buffering: false });
+      updateDebugState({
+        framesRendered: framesRenderedRef.current,
+        frameBufferSize: frameBufferRef.current.length,
+      });
     } else {
       updateState({ buffering: true });
+      updateDebugState({ frameBufferSize: frameBufferRef.current.length });
     }
 
     fillFrameBuffer();
     fillAudioBuffer();
 
     animationFrameRef.current = requestAnimationFrame(renderLoop);
-  }, [chooseFrame, fillFrameBuffer, fillAudioBuffer, updateState]);
+  }, [chooseFrame, fillFrameBuffer, fillAudioBuffer, updateState, updateDebugState]);
 
   const play = useCallback(async () => {
     if (isPlayingRef.current) return;
@@ -638,6 +686,32 @@ export function WebCodecsVideoPlayer({
             </div>
           </button>
         )}
+
+        {showDebug && (
+          <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-3 rounded-lg font-mono max-w-xs">
+            <div className="font-bold mb-2 text-yellow-400">Debug Panel</div>
+            <div className="space-y-1">
+              <div>Video Decoder: <span className={debugState.videoDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.videoDecoderState}</span></div>
+              <div>Audio Decoder: <span className={debugState.audioDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.audioDecoderState}</span></div>
+              <div>Demuxer Ready: <span className={debugState.demuxerReady ? "text-green-400" : "text-red-400"}>{debugState.demuxerReady ? "Yes" : "No"}</span></div>
+              <div>Frame Buffer: <span className={debugState.frameBufferSize > 0 ? "text-green-400" : "text-yellow-400"}>{debugState.frameBufferSize}</span></div>
+              <div>Chunks Decoded: <span className="text-blue-400">{debugState.chunksDecoded}</span></div>
+              <div>Frames Rendered: <span className="text-blue-400">{debugState.framesRendered}</span></div>
+              <div>Buffering: <span className={state.buffering ? "text-yellow-400" : "text-green-400"}>{state.buffering ? "Yes" : "No"}</span></div>
+              <div>Playing: <span className={state.isPlaying ? "text-green-400" : "text-gray-400"}>{state.isPlaying ? "Yes" : "No"}</span></div>
+              {debugState.lastError && (
+                <div className="text-red-400 mt-2 break-words">Error: {debugState.lastError}</div>
+              )}
+            </div>
+          </div>
+        )}
+
+        <button
+          onClick={() => setShowDebug(!showDebug)}
+          className="absolute top-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded hover:bg-black/80"
+        >
+          {showDebug ? "Hide Debug" : "Show Debug"}
+        </button>
       </div>
 
       <div className="bg-gradient-to-t from-black via-black/90 to-transparent p-6 space-y-4">

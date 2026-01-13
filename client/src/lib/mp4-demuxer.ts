@@ -264,6 +264,7 @@ export class MP4Demuxer {
     this.file?.setExtractionOptions(track.id, undefined, {
       nbSamples: 100,
     });
+    this.file?.start();
   }
 
   private async readSample(): Promise<MP4Sample | null> {
