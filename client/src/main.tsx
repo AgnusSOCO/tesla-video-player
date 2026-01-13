@@ -44,29 +44,30 @@ console.log("- MODE:", import.meta.env.MODE);
 console.log("- DEV:", import.meta.env.DEV);
 console.log("- PROD:", import.meta.env.PROD);
 
+// Construct the API URL
+const getApiUrl = (): string => {
+  const envUrl = import.meta.env.VITE_API_URL;
+  
+  console.log("[tRPC] getApiUrl called with envUrl:", envUrl);
+  
+  // If environment variable is set, use it
+  if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
+    const cleanUrl = envUrl.replace(/\/$/, ''); // Remove trailing slash
+    const finalUrl = `${cleanUrl}/api/trpc`;
+    console.log("[tRPC] Using API URL:", finalUrl);
+    return finalUrl;
+  }
+  
+  // Fallback for development or missing env var
+  const fallbackUrl = `${window.location.origin}/api/trpc`;
+  console.log("[tRPC] Using fallback URL:", fallbackUrl);
+  return fallbackUrl;
+};
+
 const trpcClient = trpc.createClient({
   links: [
     httpBatchLink({
-      url: () => {
-        // This function is called at runtime, not build time
-        const envUrl = import.meta.env.VITE_API_URL;
-        
-        console.log("[tRPC] Creating client with envUrl:", envUrl);
-        
-        // If environment variable is set, use it
-        if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
-          const cleanUrl = envUrl.replace(/\/$/, ''); // Remove trailing slash
-          const finalUrl = `${cleanUrl}/api/trpc`;
-          console.log("[tRPC] Using API URL:", finalUrl);
-          return finalUrl;
-        }
-        
-        // Fallback for development or missing env var
-        // Use absolute URL with current origin
-        const fallbackUrl = `${window.location.origin}/api/trpc`;
-        console.log("[tRPC] Using fallback URL:", fallbackUrl);
-        return fallbackUrl;
-      },
+      url: getApiUrl(), // Call the function once and pass the string result
       transformer: superjson,
       fetch(input, init) {
         return globalThis.fetch(input, {
