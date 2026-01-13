@@ -37,6 +37,13 @@ queryClient.getMutationCache().subscribe(event => {
   }
 });
 
+// Debug: Log environment variables
+console.log("[Tesla Video Player] Environment check:");
+console.log("- VITE_API_URL:", import.meta.env.VITE_API_URL);
+console.log("- MODE:", import.meta.env.MODE);
+console.log("- DEV:", import.meta.env.DEV);
+console.log("- PROD:", import.meta.env.PROD);
+
 const trpcClient = trpc.createClient({
   links: [
     httpBatchLink({
@@ -44,15 +51,21 @@ const trpcClient = trpc.createClient({
         // This function is called at runtime, not build time
         const envUrl = import.meta.env.VITE_API_URL;
         
+        console.log("[tRPC] Creating client with envUrl:", envUrl);
+        
         // If environment variable is set, use it
         if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
           const cleanUrl = envUrl.replace(/\/$/, ''); // Remove trailing slash
-          return `${cleanUrl}/api/trpc`;
+          const finalUrl = `${cleanUrl}/api/trpc`;
+          console.log("[tRPC] Using API URL:", finalUrl);
+          return finalUrl;
         }
         
         // Fallback for development or missing env var
         // Use absolute URL with current origin
-        return `${window.location.origin}/api/trpc`;
+        const fallbackUrl = `${window.location.origin}/api/trpc`;
+        console.log("[tRPC] Using fallback URL:", fallbackUrl);
+        return fallbackUrl;
       },
       transformer: superjson,
       fetch(input, init) {
@@ -64,6 +77,8 @@ const trpcClient = trpc.createClient({
     }),
   ],
 });
+
+console.log("[Tesla Video Player] tRPC client created successfully");
 
 createRoot(document.getElementById("root")!).render(
   <trpc.Provider client={trpcClient} queryClient={queryClient}>
