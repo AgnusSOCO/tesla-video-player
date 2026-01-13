@@ -44,7 +44,7 @@ console.log("- MODE:", import.meta.env.MODE);
 console.log("- DEV:", import.meta.env.DEV);
 console.log("- PROD:", import.meta.env.PROD);
 
-// Construct the API URL
+// Construct the API URL - call once at initialization
 const getApiUrl = (): string => {
   const envUrl = import.meta.env.VITE_API_URL;
   
@@ -64,14 +64,19 @@ const getApiUrl = (): string => {
   return fallbackUrl;
 };
 
+// Get the API URL once at initialization
+const apiUrl = getApiUrl();
+console.log("[tRPC] Final API URL for client:", apiUrl);
+
 const trpcClient = trpc.createClient({
   links: [
     httpBatchLink({
-      url: getApiUrl(), // Call the function once and pass the string result
+      url: apiUrl, // Pass the string directly, not a function
       transformer: superjson,
-      fetch(input, init) {
-        return globalThis.fetch(input, {
-          ...(init ?? {}),
+      fetch(url, init) {
+        console.log("[tRPC] Fetching:", url);
+        return fetch(url, {
+          ...init,
           credentials: "include",
         });
       },
