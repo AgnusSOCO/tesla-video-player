@@ -80,6 +80,7 @@ export function WebCodecsVideoPlayer({
 
   const initializePlayer = useCallback(async () => {
     try {
+      isCleanedUpRef.current = false;
       updateState({ isLoading: true, error: null });
 
       if (!("VideoDecoder" in window)) {
