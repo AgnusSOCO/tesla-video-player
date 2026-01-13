@@ -18,7 +18,8 @@ export default function Auth() {
       setAuthToken(data.authToken);
       
       // Generate QR code with Telegram deep link
-      const telegramUrl = `https://t.me/YOUR_BOT_USERNAME?start=${data.authToken}`;
+      const botUsername = import.meta.env.VITE_TELEGRAM_BOT_USERNAME || 'theteslacarbot';
+      const telegramUrl = `https://t.me/${botUsername}?start=${data.authToken}`;
       const qrUrl = await QRCode.toDataURL(telegramUrl, {
         width: 300,
         margin: 2,
@@ -151,7 +152,8 @@ export default function Auth() {
             <Button
               variant="outline"
               onClick={() => {
-                const telegramUrl = `https://t.me/YOUR_BOT_USERNAME?start=${authToken}`;
+                const botUsername = import.meta.env.VITE_TELEGRAM_BOT_USERNAME || 'theteslacarbot';
+                const telegramUrl = `https://t.me/${botUsername}?start=${authToken}`;
                 window.open(telegramUrl, "_blank");
               }}
             >
