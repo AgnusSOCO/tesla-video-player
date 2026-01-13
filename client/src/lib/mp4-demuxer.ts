@@ -269,10 +269,7 @@ export class MP4Demuxer {
     }
 
     this.selectedTrack = track;
-    this.file?.setExtractionOptions(track.id, undefined, {
-      nbSamples: 100,
-    });
-    this.file?.seek(0, false);
+    this.file?.setExtractionOptions(track.id);
     this.file?.start();
   }
 
@@ -335,42 +332,48 @@ export class MP4Demuxer {
   }
 
   private getDescriptionData(): Uint8Array | undefined {
-    if (!this.file?.moov) return undefined;
+    if (!this.file || !this.videoTrack) return undefined;
 
     try {
-      const entry = this.file.moov.traks[0]?.mdia.minf.stbl.stsd.entries[0];
-      if (!entry) return undefined;
+      const trak = this.file.getTrackById(this.videoTrack.id);
+      if (!trak) return undefined;
 
-      const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
-      if (!box) return undefined;
-
-      const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
-      box.write(stream);
-
-      return new Uint8Array(stream.buffer, 8);
+      for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+        if (box) {
+          const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+          box.write(stream);
+          return new Uint8Array(stream.buffer, 8);
+        }
+      }
+      return undefined;
     } catch {
       return undefined;
     }
   }
 
   private getAudioSpecificConfig(): Uint8Array | undefined {
-    if (!this.file?.moov) return undefined;
+    if (!this.file || !this.audioTrack) return undefined;
 
     try {
-      const entry = this.file.moov.traks[0]?.mdia.minf.stbl.stsd.entries[0];
-      if (!entry?.esds) return undefined;
+      const trak = this.file.getTrackById(this.audioTrack.id);
+      if (!trak) return undefined;
 
-      const descs = entry.esds.esd.descs;
-      if (!descs || descs.length === 0) return undefined;
+      for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        if (!entry?.esds) continue;
 
-      const decoderConfigDesc = descs[0];
-      if (decoderConfigDesc.tag !== 0x04) return undefined;
+        const descs = entry.esds.esd.descs;
+        if (!descs || descs.length === 0) continue;
 
-      const decSpecificInfoDesc = decoderConfigDesc.descs?.[0];
-      if (!decSpecificInfoDesc || decSpecificInfoDesc.tag !== 0x05)
-        return undefined;
+        const decoderConfigDesc = descs[0];
+        if (decoderConfigDesc.tag !== 0x04) continue;
 
-      return decSpecificInfoDesc.data;
+        const decSpecificInfoDesc = decoderConfigDesc.descs?.[0];
+        if (!decSpecificInfoDesc || decSpecificInfoDesc.tag !== 0x05) continue;
+
+        return decSpecificInfoDesc.data;
+      }
+      return undefined;
     } catch {
       return undefined;
     }
