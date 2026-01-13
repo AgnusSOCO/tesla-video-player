@@ -43,13 +43,26 @@ export default function Auth() {
     }
   );
 
+  // Login mutation to set session cookie
+  const loginMutation = trpc.auth.loginWithTelegram.useMutation({
+    onSuccess: () => {
+      // Session cookie set, redirect to home
+      setLocation("/");
+    },
+    onError: (error) => {
+      console.error("Login failed:", error);
+      setIsPolling(false);
+    },
+  });
+
   // Check if authenticated
   useEffect(() => {
-    if (authStatus?.verified && authStatus.userId) {
-      // Authentication successful, redirect to home
-      setLocation("/");
+    if (authStatus?.verified && authStatus.userId && authToken) {
+      // Stop polling and call login to set session cookie
+      setIsPolling(false);
+      loginMutation.mutate({ authToken });
     }
-  }, [authStatus, setLocation]);
+  }, [authStatus, authToken]);
 
   // Generate token on mount
   useEffect(() => {
