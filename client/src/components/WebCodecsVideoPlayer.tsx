@@ -270,7 +270,15 @@ export function WebCodecsVideoPlayer({
       return;
     }
 
+    // Schedule audio buffers ahead of time to prevent gaps
+    // Keep scheduling until we have at least 0.5 seconds of audio queued
+    const minAudioAhead = 0.5;
+    
     while (audioBufferQueueRef.current.length > 0) {
+      // Stop scheduling if we have enough audio queued ahead
+      const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
+      if (audioAhead > minAudioAhead) break;
+      
       const audioData = audioBufferQueueRef.current.shift();
       if (!audioData) continue;
 
@@ -306,6 +314,11 @@ export function WebCodecsVideoPlayer({
       nextAudioTimeRef.current = startTime + audioBuffer.duration;
 
       audioData.close();
+    }
+    
+    // Continue scheduling periodically if we're playing
+    if (isPlayingRef.current && audioBufferQueueRef.current.length > 0) {
+      setTimeout(() => scheduleAudioPlayback(), 100);
     }
   }, []);
 
@@ -372,14 +385,15 @@ export function WebCodecsVideoPlayer({
     audioFillInProgressRef.current = true;
 
     try {
-      const targetChunks = 10;
+      // Increased batch size and queue limit for smoother audio
+      const targetChunks = 30;
       let decodedChunks = 0;
 
       while (
         decodedChunks < targetChunks &&
         audioDecoderRef.current &&
         audioDecoderRef.current.state !== "closed" &&
-        audioDecoderRef.current.decodeQueueSize < 5
+        audioDecoderRef.current.decodeQueueSize < 20
       ) {
         const chunk = await audioDemuxerRef.current.getNextChunk();
         if (!chunk) break;
@@ -389,14 +403,18 @@ export function WebCodecsVideoPlayer({
         decodedChunks++;
       }
 
-      if (decodedChunks > 0 && audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
-        await audioDecoderRef.current.flush();
-      }
+      // Don't call flush() during normal playback - it blocks and causes audio gaps
+      // Let the decoder output frames asynchronously via the output callback
     } catch (err) {
       console.error("Error filling audio buffer:", err);
     }
 
     audioFillInProgressRef.current = false;
+    
+    // Continue filling if we're still playing
+    if (isPlayingRef.current && !isCleanedUpRef.current) {
+      setTimeout(() => fillAudioBuffer(), 50);
+    }
   }, []);
 
   const chooseFrame = useCallback((targetTimestamp: number): VideoFrame | null => {
