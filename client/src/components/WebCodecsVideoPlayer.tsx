@@ -53,7 +53,7 @@ interface DebugState {
   audioIsEOF: boolean;
 }
 
-const FRAME_BUFFER_TARGET_SIZE = 3;
+const FRAME_BUFFER_TARGET_SIZE = 10;
 const AUDIO_BUFFER_DURATION = 0.5;
 
 export function WebCodecsVideoPlayer({
@@ -109,6 +109,7 @@ export function WebCodecsVideoPlayer({
   const audioFillInProgressRef = useRef<boolean>(false);
   const nextAudioTimeRef = useRef<number>(0);
   const isCleanedUpRef = useRef<boolean>(false);
+  const needsKeyframeRef = useRef<boolean>(true); // After configure() or flush(), we need a keyframe
 
   const updateState = useCallback((updates: Partial<PlayerState>) => {
     setState((prev) => ({ ...prev, ...updates }));
@@ -315,27 +316,35 @@ export function WebCodecsVideoPlayer({
     fillInProgressRef.current = true;
 
     try {
-      let chunksDecoded = 0;
       while (
         frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE &&
         videoDecoderRef.current &&
         videoDecoderRef.current.state !== "closed" &&
-        videoDecoderRef.current.decodeQueueSize < FRAME_BUFFER_TARGET_SIZE
+        videoDecoderRef.current.decodeQueueSize < FRAME_BUFFER_TARGET_SIZE * 2
       ) {
         const chunk = await videoDemuxerRef.current.getNextChunk();
         if (!chunk) break;
         if (isCleanedUpRef.current || videoDecoderRef.current.state === "closed") break;
 
-        videoDecoderRef.current.decode(chunk as EncodedVideoChunk);
-        chunksDecoded++;
+        const videoChunk = chunk as EncodedVideoChunk;
+        
+        // After configure() or flush(), we need to start with a keyframe
+        if (needsKeyframeRef.current) {
+          if (videoChunk.type !== "key") {
+            // Skip delta frames until we get a keyframe
+            continue;
+          }
+          needsKeyframeRef.current = false;
+        }
+
+        videoDecoderRef.current.decode(videoChunk);
         chunksDecodedRef.current++;
       }
 
       updateDebugState({ chunksDecoded: chunksDecodedRef.current });
-
-      if (chunksDecoded > 0 && videoDecoderRef.current && videoDecoderRef.current.state !== "closed") {
-        await videoDecoderRef.current.flush();
-      }
+      
+      // Don't call flush() during normal playback - it causes the keyframe requirement issue
+      // flush() should only be called when seeking or stopping
     } catch (err) {
       console.error("Error filling frame buffer:", err);
       updateDebugState({ lastError: `fillFrameBuffer: ${err instanceof Error ? err.message : String(err)}` });
@@ -344,7 +353,7 @@ export function WebCodecsVideoPlayer({
     fillInProgressRef.current = false;
 
     if (!isCleanedUpRef.current && frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
-      setTimeout(() => fillFrameBuffer(), 0);
+      setTimeout(() => fillFrameBuffer(), 10);
     }
   }, [updateDebugState]);
 
@@ -529,6 +538,9 @@ export function WebCodecsVideoPlayer({
 
       mediaStartTimeRef.current = newTime * 1_000_000;
       updateState({ currentTime: newTime });
+
+      // After seeking, we need to start with a keyframe
+      needsKeyframeRef.current = true;
 
       videoDemuxerRef.current?.seek(newTime);
       audioDemuxerRef.current?.seek(newTime);
