@@ -2,7 +2,7 @@ import { useState } from "react";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { CanvasVideoPlayer } from "@/components/CanvasVideoPlayer";
+import { WebCodecsVideoPlayer } from "@/components/WebCodecsVideoPlayer";
 import { Loader2, Play, Trash2, Video as VideoIcon } from "lucide-react";
 import {
   AlertDialog,
@@ -57,7 +57,7 @@ export default function VideoLibrary() {
   // Show video player if video is selected
   if (selectedVideo && videoDetails) {
     return (
-      <CanvasVideoPlayer
+      <WebCodecsVideoPlayer
         videoUrl={videoDetails.fileUrl}
         title={videoDetails.title}
         onClose={() => setSelectedVideo(null)}
