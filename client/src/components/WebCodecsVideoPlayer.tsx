@@ -110,6 +110,12 @@ export function WebCodecsVideoPlayer({
   const nextAudioTimeRef = useRef<number>(0);
   const isCleanedUpRef = useRef<boolean>(false);
   const needsKeyframeRef = useRef<boolean>(true); // After configure() or flush(), we need a keyframe
+  
+  // A/V sync: Use audioContext.currentTime as master clock
+  // audioStartTimeRef = audioContext.currentTime when playback started
+  // mediaTimeOffsetRef = media timestamp (in seconds) at audioStartTimeRef
+  const audioStartTimeRef = useRef<number>(0);
+  const mediaTimeOffsetRef = useRef<number>(0);
 
   const updateState = useCallback((updates: Partial<PlayerState>) => {
     setState((prev) => ({ ...prev, ...updates }));
@@ -430,8 +436,16 @@ export function WebCodecsVideoPlayer({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const elapsedTime = performance.now() - playbackStartTimeRef.current;
-    const currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
+    // Use AudioContext as master clock for A/V sync
+    // If no audio context, fall back to performance.now()
+    let currentMediaTime: number;
+    if (audioContextRef.current) {
+      const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
+      currentMediaTime = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000; // Convert to microseconds
+    } else {
+      const elapsedTime = performance.now() - playbackStartTimeRef.current;
+      currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
+    }
 
     const frame = chooseFrame(currentMediaTime);
 
@@ -483,6 +497,14 @@ export function WebCodecsVideoPlayer({
       await audioContextRef.current.resume();
     }
 
+    // Initialize A/V sync timing
+    // audioStartTimeRef = current audioContext time
+    // mediaTimeOffsetRef = current media position in seconds
+    if (audioContextRef.current) {
+      audioStartTimeRef.current = audioContextRef.current.currentTime;
+      mediaTimeOffsetRef.current = mediaStartTimeRef.current / 1_000_000; // Convert from microseconds to seconds
+    }
+    
     nextAudioTimeRef.current = audioContextRef.current?.currentTime || 0;
     playbackStartTimeRef.current = performance.now();
 
@@ -501,8 +523,14 @@ export function WebCodecsVideoPlayer({
       animationFrameRef.current = null;
     }
 
-    mediaStartTimeRef.current +=
-      (performance.now() - playbackStartTimeRef.current) * 1000;
+    // Save current media position based on audio context time (for A/V sync)
+    if (audioContextRef.current) {
+      const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
+      mediaStartTimeRef.current = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000;
+    } else {
+      mediaStartTimeRef.current +=
+        (performance.now() - playbackStartTimeRef.current) * 1000;
+    }
 
     if (audioContextRef.current?.state === "running") {
       audioContextRef.current.suspend();
