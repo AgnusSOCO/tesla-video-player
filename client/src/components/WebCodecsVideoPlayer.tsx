@@ -271,8 +271,9 @@ export function WebCodecsVideoPlayer({
     }
 
     // Schedule audio buffers ahead of time to prevent gaps
-    // Keep scheduling until we have at least 0.5 seconds of audio queued
-    const minAudioAhead = 0.5;
+    // Keep scheduling until we have at least 1.5 seconds of audio queued
+    // Increased from 0.5s to reduce choppiness
+    const minAudioAhead = 1.5;
     
     while (audioBufferQueueRef.current.length > 0) {
       // Stop scheduling if we have enough audio queued ahead
@@ -317,8 +318,9 @@ export function WebCodecsVideoPlayer({
     }
     
     // Continue scheduling periodically if we're playing
+    // Reduced interval from 100ms to 50ms for more responsive scheduling
     if (isPlayingRef.current && audioBufferQueueRef.current.length > 0) {
-      setTimeout(() => scheduleAudioPlayback(), 100);
+      setTimeout(() => scheduleAudioPlayback(), 50);
     }
   }, []);
 
@@ -386,14 +388,15 @@ export function WebCodecsVideoPlayer({
 
     try {
       // Increased batch size and queue limit for smoother audio
-      const targetChunks = 30;
+      // Decode more chunks at once to keep buffer full
+      const targetChunks = 50;
       let decodedChunks = 0;
 
       while (
         decodedChunks < targetChunks &&
         audioDecoderRef.current &&
         audioDecoderRef.current.state !== "closed" &&
-        audioDecoderRef.current.decodeQueueSize < 20
+        audioDecoderRef.current.decodeQueueSize < 30
       ) {
         const chunk = await audioDemuxerRef.current.getNextChunk();
         if (!chunk) break;
@@ -412,8 +415,9 @@ export function WebCodecsVideoPlayer({
     audioFillInProgressRef.current = false;
     
     // Continue filling if we're still playing
+    // Reduced interval from 50ms to 20ms for faster buffer refilling
     if (isPlayingRef.current && !isCleanedUpRef.current) {
-      setTimeout(() => fillAudioBuffer(), 50);
+      setTimeout(() => fillAudioBuffer(), 20);
     }
   }, []);
 
