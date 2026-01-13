@@ -265,6 +265,7 @@ export function WebCodecsVideoPlayer({
     fillInProgressRef.current = true;
 
     try {
+      let chunksDecoded = 0;
       while (
         frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE &&
         videoDecoderRef.current &&
@@ -276,6 +277,11 @@ export function WebCodecsVideoPlayer({
         if (isCleanedUpRef.current || videoDecoderRef.current.state === "closed") break;
 
         videoDecoderRef.current.decode(chunk as EncodedVideoChunk);
+        chunksDecoded++;
+      }
+
+      if (chunksDecoded > 0 && videoDecoderRef.current && videoDecoderRef.current.state !== "closed") {
+        await videoDecoderRef.current.flush();
       }
     } catch (err) {
       console.error("Error filling frame buffer:", err);
@@ -312,6 +318,10 @@ export function WebCodecsVideoPlayer({
 
         audioDecoderRef.current.decode(chunk as EncodedAudioChunk);
         decodedChunks++;
+      }
+
+      if (decodedChunks > 0 && audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
+        await audioDecoderRef.current.flush();
       }
     } catch (err) {
       console.error("Error filling audio buffer:", err);
