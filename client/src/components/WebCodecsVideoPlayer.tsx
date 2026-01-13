@@ -45,6 +45,12 @@ interface DebugState {
   framesRendered: number;
   lastError: string | null;
   demuxerReady: boolean;
+  videoSamplesReceived: number;
+  audioSamplesReceived: number;
+  videoTrackId: number | null;
+  audioTrackId: number | null;
+  videoIsEOF: boolean;
+  audioIsEOF: boolean;
 }
 
 const FRAME_BUFFER_TARGET_SIZE = 3;
@@ -75,6 +81,12 @@ export function WebCodecsVideoPlayer({
     framesRendered: 0,
     lastError: null,
     demuxerReady: false,
+    videoSamplesReceived: 0,
+    audioSamplesReceived: 0,
+    videoTrackId: null,
+    audioTrackId: null,
+    videoIsEOF: false,
+    audioIsEOF: false,
   });
   const [showDebug, setShowDebug] = useState(true);
   const chunksDecodedRef = useRef(0);
@@ -414,6 +426,9 @@ export function WebCodecsVideoPlayer({
 
     const frame = chooseFrame(currentMediaTime);
 
+    const videoDebug = videoDemuxerRef.current?.getDebugInfo();
+    const audioDebug = audioDemuxerRef.current?.getDebugInfo();
+
     if (frame) {
       ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
       framesRenderedRef.current++;
@@ -423,10 +438,24 @@ export function WebCodecsVideoPlayer({
       updateDebugState({
         framesRendered: framesRenderedRef.current,
         frameBufferSize: frameBufferRef.current.length,
+        videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
+        audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
+        videoTrackId: videoDebug?.trackId ?? null,
+        audioTrackId: audioDebug?.trackId ?? null,
+        videoIsEOF: videoDebug?.isEOF ?? false,
+        audioIsEOF: audioDebug?.isEOF ?? false,
       });
     } else {
       updateState({ buffering: true });
-      updateDebugState({ frameBufferSize: frameBufferRef.current.length });
+      updateDebugState({
+        frameBufferSize: frameBufferRef.current.length,
+        videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
+        audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
+        videoTrackId: videoDebug?.trackId ?? null,
+        audioTrackId: audioDebug?.trackId ?? null,
+        videoIsEOF: videoDebug?.isEOF ?? false,
+        audioIsEOF: audioDebug?.isEOF ?? false,
+      });
     }
 
     fillFrameBuffer();
@@ -688,12 +717,21 @@ export function WebCodecsVideoPlayer({
         )}
 
         {showDebug && (
-          <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-3 rounded-lg font-mono max-w-xs">
+          <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-3 rounded-lg font-mono max-w-sm">
             <div className="font-bold mb-2 text-yellow-400">Debug Panel</div>
             <div className="space-y-1">
               <div>Video Decoder: <span className={debugState.videoDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.videoDecoderState}</span></div>
               <div>Audio Decoder: <span className={debugState.audioDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.audioDecoderState}</span></div>
               <div>Demuxer Ready: <span className={debugState.demuxerReady ? "text-green-400" : "text-red-400"}>{debugState.demuxerReady ? "Yes" : "No"}</span></div>
+              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Video Demuxer:</div>
+              <div>Track ID: <span className="text-blue-400">{debugState.videoTrackId ?? "null"}</span></div>
+              <div>Samples Received: <span className={debugState.videoSamplesReceived > 0 ? "text-green-400" : "text-red-400"}>{debugState.videoSamplesReceived}</span></div>
+              <div>EOF: <span className={debugState.videoIsEOF ? "text-yellow-400" : "text-gray-400"}>{debugState.videoIsEOF ? "Yes" : "No"}</span></div>
+              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Audio Demuxer:</div>
+              <div>Track ID: <span className="text-blue-400">{debugState.audioTrackId ?? "null"}</span></div>
+              <div>Samples Received: <span className={debugState.audioSamplesReceived > 0 ? "text-green-400" : "text-red-400"}>{debugState.audioSamplesReceived}</span></div>
+              <div>EOF: <span className={debugState.audioIsEOF ? "text-yellow-400" : "text-gray-400"}>{debugState.audioIsEOF ? "Yes" : "No"}</span></div>
+              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Playback:</div>
               <div>Frame Buffer: <span className={debugState.frameBufferSize > 0 ? "text-green-400" : "text-yellow-400"}>{debugState.frameBufferSize}</span></div>
               <div>Chunks Decoded: <span className="text-blue-400">{debugState.chunksDecoded}</span></div>
               <div>Frames Rendered: <span className="text-blue-400">{debugState.framesRendered}</span></div>

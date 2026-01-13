@@ -49,6 +49,8 @@ export class MP4Demuxer {
   private infoResolver: ((info: MP4Info) => void) | null = null;
   private fetchAbortController: AbortController | null = null;
   private isEOF = false;
+  private totalSamplesReceived = 0;
+  private onSamplesCallCount = 0;
 
   constructor(fileUri: string) {
     this.fileUri = fileUri;
@@ -299,6 +301,8 @@ export class MP4Demuxer {
   private onSamples(samples: MP4Sample[]): void {
     const SAMPLE_BUFFER_TARGET_SIZE = 50;
 
+    this.onSamplesCallCount++;
+    this.totalSamplesReceived += samples.length;
     this.readySamples.push(...samples);
 
     if (this.readySamples.length >= SAMPLE_BUFFER_TARGET_SIZE) {
@@ -309,6 +313,24 @@ export class MP4Demuxer {
       this.pendingReadResolver.resolve(this.readySamples.shift()!);
       this.pendingReadResolver = null;
     }
+  }
+
+  getDebugInfo(): {
+    trackId: number | null;
+    trackType: string;
+    samplesReceived: number;
+    onSamplesCallCount: number;
+    readySamplesLength: number;
+    isEOF: boolean;
+  } {
+    return {
+      trackId: this.selectedTrack?.id ?? null,
+      trackType: this.streamType === AUDIO_STREAM_TYPE ? "audio" : "video",
+      samplesReceived: this.totalSamplesReceived,
+      onSamplesCallCount: this.onSamplesCallCount,
+      readySamplesLength: this.readySamples.length,
+      isEOF: this.isEOF,
+    };
   }
 
   private getDescriptionData(): Uint8Array | undefined {
