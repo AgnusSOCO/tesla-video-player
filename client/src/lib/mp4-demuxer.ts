@@ -62,20 +62,18 @@ export class MP4Demuxer {
     this.pendingReadResolver = null;
     this.isEOF = false;
 
-    await this.fetchAndParse();
+    // Pass streamType so track can be selected in onReady while data is still streaming
+    await this.fetchAndParse(streamType);
 
-    if (streamType === AUDIO_STREAM_TYPE && this.audioTrack) {
-      this.selectTrack(this.audioTrack);
-    } else if (streamType === VIDEO_STREAM_TYPE && this.videoTrack) {
-      this.selectTrack(this.videoTrack);
-    } else {
+    // Verify track was selected in onReady
+    if (!this.selectedTrack) {
       throw new Error(
         `No ${streamType === AUDIO_STREAM_TYPE ? "audio" : "video"} track found`
       );
     }
   }
 
-  private async fetchAndParse(): Promise<void> {
+  private async fetchAndParse(streamType: StreamType): Promise<void> {
     this.file = createFile();
 
     this.file.onError = (e: string) => {
@@ -86,6 +84,16 @@ export class MP4Demuxer {
       this.info = info;
       this.videoTrack = info.videoTracks[0] || null;
       this.audioTrack = info.audioTracks[0] || null;
+
+      // Select track and start extraction HERE, while data is still streaming
+      // This matches the W3C WebCodecs sample pattern
+      const track =
+        streamType === AUDIO_STREAM_TYPE ? this.audioTrack : this.videoTrack;
+      if (track && !this.selectedTrack) {
+        this.selectedTrack = track;
+        this.file?.setExtractionOptions(track.id);
+        this.file?.start();
+      }
 
       if (this.infoResolver) {
         this.infoResolver(info);
