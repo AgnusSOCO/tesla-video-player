@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useLocation } from "wouter";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ export default function Auth() {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [qrCodeUrl, setQrCodeUrl] = useState<string | null>(null);
   const [isPolling, setIsPolling] = useState(false);
+  const hasGeneratedToken = useRef(false);
 
   // Generate auth token
   const generateTokenMutation = trpc.auth.generateAuthToken.useMutation({
@@ -64,9 +65,12 @@ export default function Auth() {
     }
   }, [authStatus, authToken]);
 
-  // Generate token on mount
+  // Generate token on mount (only once)
   useEffect(() => {
-    generateTokenMutation.mutate();
+    if (!hasGeneratedToken.current) {
+      hasGeneratedToken.current = true;
+      generateTokenMutation.mutate();
+    }
   }, []);
 
   if (generateTokenMutation.isPending) {
