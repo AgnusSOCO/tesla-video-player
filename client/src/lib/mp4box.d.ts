@@ -90,6 +90,35 @@ declare module "mp4box" {
     write(stream: DataStream): void;
   }
 
+  export interface MP4Trak {
+    mdia: {
+      minf: {
+        stbl: {
+          stsd: {
+            entries: Array<{
+              avcC?: MP4BoxDescription;
+              hvcC?: MP4BoxDescription;
+              vpcC?: MP4BoxDescription;
+              av1C?: MP4BoxDescription;
+              esds?: {
+                esd: {
+                  descs: Array<{
+                    tag: number;
+                    oti?: number;
+                    descs?: Array<{
+                      tag: number;
+                      data: Uint8Array;
+                    }>;
+                  }>;
+                };
+              };
+            }>;
+          };
+        };
+      };
+    };
+  }
+
   export interface MP4ArrayBuffer extends ArrayBuffer {
     fileStart: number;
   }
@@ -111,7 +140,7 @@ declare module "mp4box" {
     ): void;
     unsetExtractionOptions(trackId: number): void;
     seek(time: number, useRap?: boolean): { offset: number; time: number };
-    getTrackById(trackId: number): MP4MediaTrack | undefined;
+    getTrackById(trackId: number): MP4Trak | undefined;
 
     moov?: {
       traks: Array<{
