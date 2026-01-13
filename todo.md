@@ -89,3 +89,15 @@
 - [ ] User uploads backend to GitHub and connects Railway
 - [x] Update frontend repo to remove backend files
 - [x] Update documentation with new repo structure
+
+
+## Telegram Bot Deployment
+- [ ] Create Dockerfile for Telegram bot
+- [ ] Add bot deployment instructions
+- [ ] Configure environment variables for bot
+
+## S3 Storage Configuration
+- [ ] Create S3 upload endpoint in backend
+- [ ] Update Telegram bot to upload to S3
+- [ ] Add video streaming endpoint with range requests
+- [ ] Configure CORS for S3 bucket

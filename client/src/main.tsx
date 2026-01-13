@@ -37,21 +37,23 @@ queryClient.getMutationCache().subscribe(event => {
   }
 });
 
-// Get API URL from environment variable or use relative path
-const getApiUrl = () => {
-  // In production (Vercel), use the environment variable
-  if (import.meta.env.VITE_API_URL) {
-    return import.meta.env.VITE_API_URL;
-  }
-  
-  // In development, use relative path (proxied by Vite)
-  return "";
-};
-
 const trpcClient = trpc.createClient({
   links: [
     httpBatchLink({
-      url: `${getApiUrl()}/api/trpc`,
+      url: () => {
+        // This function is called at runtime, not build time
+        const envUrl = import.meta.env.VITE_API_URL;
+        
+        // If environment variable is set, use it
+        if (envUrl && typeof envUrl === 'string' && envUrl.trim() !== '') {
+          const cleanUrl = envUrl.replace(/\/$/, ''); // Remove trailing slash
+          return `${cleanUrl}/api/trpc`;
+        }
+        
+        // Fallback for development or missing env var
+        // Use absolute URL with current origin
+        return `${window.location.origin}/api/trpc`;
+      },
       transformer: superjson,
       fetch(input, init) {
         return globalThis.fetch(input, {
