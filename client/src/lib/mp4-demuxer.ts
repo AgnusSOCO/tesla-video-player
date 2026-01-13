@@ -148,6 +148,9 @@ export class MP4Demuxer {
         if (done) {
           this.file?.flush();
           this.isEOF = true;
+          if (this.selectedTrack) {
+            this.file?.start();
+          }
           break;
         }
 
@@ -155,6 +158,9 @@ export class MP4Demuxer {
         buffer.fileStart = offset;
         offset += buffer.byteLength;
         this.file?.appendBuffer(buffer);
+        if (this.selectedTrack) {
+          this.file?.start();
+        }
       }
     };
 
