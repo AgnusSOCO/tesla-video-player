@@ -72,6 +72,7 @@ export function WebCodecsVideoPlayer({
   const fillInProgressRef = useRef<boolean>(false);
   const audioFillInProgressRef = useRef<boolean>(false);
   const nextAudioTimeRef = useRef<number>(0);
+  const isCleanedUpRef = useRef<boolean>(false);
 
   const updateState = useCallback((updates: Partial<PlayerState>) => {
     setState((prev) => ({ ...prev, ...updates }));
@@ -255,18 +256,23 @@ export function WebCodecsVideoPlayer({
 
   const fillFrameBuffer = useCallback(async () => {
     if (fillInProgressRef.current) return;
+    if (isCleanedUpRef.current) return;
     if (frameBufferRef.current.length >= FRAME_BUFFER_TARGET_SIZE) return;
     if (!videoDemuxerRef.current || !videoDecoderRef.current) return;
+    if (videoDecoderRef.current.state === "closed") return;
 
     fillInProgressRef.current = true;
 
     try {
       while (
         frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE &&
+        videoDecoderRef.current &&
+        videoDecoderRef.current.state !== "closed" &&
         videoDecoderRef.current.decodeQueueSize < FRAME_BUFFER_TARGET_SIZE
       ) {
         const chunk = await videoDemuxerRef.current.getNextChunk();
         if (!chunk) break;
+        if (isCleanedUpRef.current || videoDecoderRef.current.state === "closed") break;
 
         videoDecoderRef.current.decode(chunk as EncodedVideoChunk);
       }
@@ -276,14 +282,16 @@ export function WebCodecsVideoPlayer({
 
     fillInProgressRef.current = false;
 
-    if (frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
+    if (!isCleanedUpRef.current && frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
       setTimeout(() => fillFrameBuffer(), 0);
     }
   }, []);
 
   const fillAudioBuffer = useCallback(async () => {
     if (audioFillInProgressRef.current) return;
+    if (isCleanedUpRef.current) return;
     if (!audioDemuxerRef.current || !audioDecoderRef.current) return;
+    if (audioDecoderRef.current.state === "closed") return;
 
     audioFillInProgressRef.current = true;
 
@@ -293,10 +301,13 @@ export function WebCodecsVideoPlayer({
 
       while (
         decodedChunks < targetChunks &&
+        audioDecoderRef.current &&
+        audioDecoderRef.current.state !== "closed" &&
         audioDecoderRef.current.decodeQueueSize < 5
       ) {
         const chunk = await audioDemuxerRef.current.getNextChunk();
         if (!chunk) break;
+        if (isCleanedUpRef.current || audioDecoderRef.current.state === "closed") break;
 
         audioDecoderRef.current.decode(chunk as EncodedAudioChunk);
         decodedChunks++;
@@ -507,28 +518,64 @@ export function WebCodecsVideoPlayer({
     initializePlayer();
 
     return () => {
+      if (isCleanedUpRef.current) return;
+      isCleanedUpRef.current = true;
       isPlayingRef.current = false;
 
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
       }
 
       for (const frame of frameBufferRef.current) {
-        frame.close();
+        try {
+          frame.close();
+        } catch (e) {
+          // Frame may already be closed
+        }
       }
       frameBufferRef.current = [];
 
       for (const audioData of audioBufferQueueRef.current) {
-        audioData.close();
+        try {
+          audioData.close();
+        } catch (e) {
+          // AudioData may already be closed
+        }
       }
       audioBufferQueueRef.current = [];
 
-      videoDecoderRef.current?.close();
-      audioDecoderRef.current?.close();
-      audioContextRef.current?.close();
+      if (videoDecoderRef.current && videoDecoderRef.current.state !== "closed") {
+        try {
+          videoDecoderRef.current.close();
+        } catch (e) {
+          console.warn("Error closing video decoder:", e);
+        }
+      }
+      videoDecoderRef.current = null;
+
+      if (audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
+        try {
+          audioDecoderRef.current.close();
+        } catch (e) {
+          console.warn("Error closing audio decoder:", e);
+        }
+      }
+      audioDecoderRef.current = null;
+
+      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+        try {
+          audioContextRef.current.close();
+        } catch (e) {
+          console.warn("Error closing audio context:", e);
+        }
+      }
+      audioContextRef.current = null;
 
       videoDemuxerRef.current?.stop();
       audioDemuxerRef.current?.stop();
+      videoDemuxerRef.current = null;
+      audioDemuxerRef.current = null;
     };
   }, [initializePlayer]);
 
