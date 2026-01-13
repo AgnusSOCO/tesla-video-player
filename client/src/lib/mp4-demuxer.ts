@@ -276,7 +276,11 @@ export class MP4Demuxer {
       return this.readySamples.shift()!;
     }
 
-    if (this.isEOF && this.readySamples.length === 0) {
+    if (this.isEOF) {
+      this.file?.start();
+      if (this.readySamples.length > 0) {
+        return this.readySamples.shift()!;
+      }
       return null;
     }
 
