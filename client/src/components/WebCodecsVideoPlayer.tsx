@@ -43,6 +43,7 @@ interface DebugState {
   audioBufferSize: number;
   chunksDecoded: number;
   framesRendered: number;
+  droppedFrames: number; // Track dropped frames for performance monitoring
   lastError: string | null;
   demuxerReady: boolean;
   videoSamplesReceived: number;
@@ -84,6 +85,7 @@ export function WebCodecsVideoPlayer({
     audioBufferSize: 0,
     chunksDecoded: 0,
     framesRendered: 0,
+    droppedFrames: 0,
     lastError: null,
     demuxerReady: false,
     videoSamplesReceived: 0,
@@ -309,51 +311,66 @@ export function WebCodecsVideoPlayer({
     }
 
     // Schedule audio buffers ahead of time to prevent gaps
-    // Keep scheduling until we have at least 1.5 seconds of audio queued
-    // Increased from 0.5s to reduce choppiness
-    const minAudioAhead = 1.5;
+    // Keep scheduling until we have AUDIO_SCHEDULE_AHEAD seconds of audio queued
+    const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
+    if (audioAhead > AUDIO_SCHEDULE_AHEAD) return;
     
-    while (audioBufferQueueRef.current.length > 0) {
-      // Stop scheduling if we have enough audio queued ahead
-      const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
-      if (audioAhead > minAudioAhead) break;
-      
-      const audioData = audioBufferQueueRef.current.shift();
-      if (!audioData) continue;
-
-      const numberOfFrames = audioData.numberOfFrames;
-      const numberOfChannels = audioData.numberOfChannels;
-      const sampleRate = audioData.sampleRate;
-
-      const audioBuffer = audioContextRef.current.createBuffer(
-        numberOfChannels,
-        numberOfFrames,
-        sampleRate
-      );
-
+    // Batch multiple audio chunks together to reduce AudioBufferSourceNode creation overhead
+    // This significantly reduces CPU usage compared to creating one source per chunk
+    const BATCH_SIZE = 10; // Combine up to 10 chunks into one buffer
+    const chunksToProcess: AudioData[] = [];
+    
+    while (chunksToProcess.length < BATCH_SIZE && audioBufferQueueRef.current.length > 0) {
+      const chunk = audioBufferQueueRef.current.shift();
+      if (chunk) chunksToProcess.push(chunk);
+    }
+    
+    if (chunksToProcess.length === 0) return;
+    
+    // Calculate total frames needed for the combined buffer
+    let totalFrames = 0;
+    const sampleRate = chunksToProcess[0].sampleRate;
+    const numberOfChannels = chunksToProcess[0].numberOfChannels;
+    
+    for (const chunk of chunksToProcess) {
+      totalFrames += chunk.numberOfFrames;
+    }
+    
+    // Create a single larger buffer for all chunks
+    const audioBuffer = audioContextRef.current.createBuffer(
+      numberOfChannels,
+      totalFrames,
+      sampleRate
+    );
+    
+    // Copy all chunks into the combined buffer
+    let frameOffset = 0;
+    for (const audioData of chunksToProcess) {
       for (let channel = 0; channel < numberOfChannels; channel++) {
-        const channelData = new Float32Array(numberOfFrames);
+        const channelData = new Float32Array(audioData.numberOfFrames);
         audioData.copyTo(channelData, {
           planeIndex: channel,
           format: "f32-planar",
         });
-        audioBuffer.copyToChannel(channelData, channel);
+        // Copy to the correct offset in the combined buffer
+        audioBuffer.getChannelData(channel).set(channelData, frameOffset);
       }
-
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(gainNodeRef.current);
-
-      const startTime = Math.max(
-        nextAudioTimeRef.current,
-        audioContextRef.current.currentTime
-      );
-      source.start(startTime);
-
-      nextAudioTimeRef.current = startTime + audioBuffer.duration;
-
+      frameOffset += audioData.numberOfFrames;
       audioData.close();
     }
+    
+    // Create and schedule the combined audio source
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(gainNodeRef.current);
+
+    const startTime = Math.max(
+      nextAudioTimeRef.current,
+      audioContextRef.current.currentTime
+    );
+    source.start(startTime);
+
+    nextAudioTimeRef.current = startTime + audioBuffer.duration;
     // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
@@ -546,6 +563,7 @@ export function WebCodecsVideoPlayer({
       updateDebugState({
         framesRendered: framesRenderedRef.current,
         chunksDecoded: chunksDecodedRef.current,
+        droppedFrames: droppedFramesRef.current,
         frameBufferSize: frameBufferRef.current.length,
         videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
         audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
@@ -916,6 +934,7 @@ export function WebCodecsVideoPlayer({
               <div>Frame Buffer: <span className={debugState.frameBufferSize > 0 ? "text-green-400" : "text-yellow-400"}>{debugState.frameBufferSize}</span></div>
               <div>Chunks Decoded: <span className="text-blue-400">{debugState.chunksDecoded}</span></div>
               <div>Frames Rendered: <span className="text-blue-400">{debugState.framesRendered}</span></div>
+              <div>Dropped Frames: <span className={debugState.droppedFrames > 0 ? "text-red-400" : "text-green-400"}>{debugState.droppedFrames}</span></div>
               <div>Buffering: <span className={state.buffering ? "text-yellow-400" : "text-green-400"}>{state.buffering ? "Yes" : "No"}</span></div>
               <div>Playing: <span className={state.isPlaying ? "text-green-400" : "text-gray-400"}>{state.isPlaying ? "Yes" : "No"}</span></div>
               {debugState.lastError && (
