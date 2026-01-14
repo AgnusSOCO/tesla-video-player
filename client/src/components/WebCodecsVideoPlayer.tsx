@@ -54,15 +54,18 @@ interface DebugState {
   audioIsEOF: boolean;
 }
 
-// Performance tuning constants
-const FRAME_BUFFER_TARGET_SIZE = 45; // Increased for smoother playback (1.5s at 30fps)
-const FRAME_BUFFER_MAX_SIZE = 90; // Hard limit to prevent memory issues (3s at 30fps)
-const AUDIO_SCHEDULE_AHEAD = 3.0; // Schedule 3 seconds of audio ahead for smoother playback
+// Performance tuning constants - optimized for super smooth playback
+const FRAME_BUFFER_TARGET_SIZE = 60; // 2 seconds at 30fps - large buffer for smooth playback
+const FRAME_BUFFER_MAX_SIZE = 120; // Hard limit to prevent memory issues (4s at 30fps)
+const AUDIO_BUFFER_TARGET_SIZE = 50; // Target audio buffer size
+const AUDIO_SCHEDULE_AHEAD = 2.0; // Schedule 2 seconds of audio ahead for gap-free playback
 const DEBUG_UPDATE_INTERVAL = 500; // Update debug panel every 500ms instead of every frame
-const FRAME_DROP_THRESHOLD = 150000; // Drop frames more than 150ms behind (in microseconds) - more lenient
-const VIDEO_FILL_INTERVAL = 30; // Fill video buffer every 30ms (more aggressive)
-const AUDIO_FILL_INTERVAL = 50; // Fill audio buffer every 50ms (more aggressive)
-const AUDIO_SCHEDULE_INTERVAL = 30; // Schedule audio every 30ms (more aggressive)
+const FRAME_DROP_THRESHOLD = 300000; // Drop frames more than 300ms behind (in microseconds) - very lenient
+const VIDEO_FILL_INTERVAL = 50; // Fill video buffer every 50ms
+const AUDIO_FILL_INTERVAL = 50; // Fill audio buffer every 50ms
+const AUDIO_SCHEDULE_INTERVAL = 30; // Schedule audio every 30ms
+const MIN_FRAMES_BEFORE_PLAY = 20; // Wait for at least 20 frames before starting playback
+const MIN_AUDIO_BEFORE_PLAY = 10; // Wait for at least 10 audio chunks before starting playback
 
 export function WebCodecsVideoPlayer({
   videoUrl,
@@ -314,68 +317,65 @@ export function WebCodecsVideoPlayer({
       return;
     }
 
-    // Schedule audio buffers ahead of time to prevent gaps
-    // Keep scheduling until we have AUDIO_SCHEDULE_AHEAD seconds of audio queued
-    const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
-    if (audioAhead > AUDIO_SCHEDULE_AHEAD) return;
+    // Schedule audio buffers using their ACTUAL timestamps from the demuxer
+    // This is critical for proper A/V sync - we must respect the original timestamps
+    const currentAudioContextTime = audioContextRef.current.currentTime;
     
-    // Batch multiple audio chunks together to reduce AudioBufferSourceNode creation overhead
-    // This significantly reduces CPU usage compared to creating one source per chunk
-    const BATCH_SIZE = 10; // Combine up to 10 chunks into one buffer
-    const chunksToProcess: AudioData[] = [];
-    
-    while (chunksToProcess.length < BATCH_SIZE && audioBufferQueueRef.current.length > 0) {
-      const chunk = audioBufferQueueRef.current.shift();
-      if (chunk) chunksToProcess.push(chunk);
-    }
-    
-    if (chunksToProcess.length === 0) return;
-    
-    // Calculate total frames needed for the combined buffer
-    let totalFrames = 0;
-    const sampleRate = chunksToProcess[0].sampleRate;
-    const numberOfChannels = chunksToProcess[0].numberOfChannels;
-    
-    for (const chunk of chunksToProcess) {
-      totalFrames += chunk.numberOfFrames;
-    }
-    
-    // Create a single larger buffer for all chunks
-    const audioBuffer = audioContextRef.current.createBuffer(
-      numberOfChannels,
-      totalFrames,
-      sampleRate
-    );
-    
-    // Copy all chunks into the combined buffer
-    let frameOffset = 0;
-    for (const audioData of chunksToProcess) {
+    // Process audio chunks one at a time to respect their timestamps
+    while (audioBufferQueueRef.current.length > 0) {
+      const audioData = audioBufferQueueRef.current[0];
+      
+      // Calculate when this audio chunk should play based on its timestamp
+      // audioData.timestamp is in microseconds, convert to seconds
+      const audioTimestampSeconds = audioData.timestamp / 1_000_000;
+      
+      // Calculate the playback time for this chunk:
+      // playbackTime = audioContextTime when playback started + (chunk timestamp - media start time)
+      const scheduledTime = audioStartTimeRef.current + (audioTimestampSeconds - mediaTimeOffsetRef.current);
+      
+      // Don't schedule audio that's too far in the future
+      if (scheduledTime > currentAudioContextTime + AUDIO_SCHEDULE_AHEAD) {
+        break;
+      }
+      
+      // Remove from queue
+      audioBufferQueueRef.current.shift();
+      
+      // Skip audio that's already in the past (we're behind)
+      if (scheduledTime < currentAudioContextTime - 0.1) {
+        audioData.close();
+        continue;
+      }
+
+      const numberOfFrames = audioData.numberOfFrames;
+      const numberOfChannels = audioData.numberOfChannels;
+      const sampleRate = audioData.sampleRate;
+
+      const audioBuffer = audioContextRef.current.createBuffer(
+        numberOfChannels,
+        numberOfFrames,
+        sampleRate
+      );
+
       for (let channel = 0; channel < numberOfChannels; channel++) {
-        const channelData = new Float32Array(audioData.numberOfFrames);
+        const channelData = new Float32Array(numberOfFrames);
         audioData.copyTo(channelData, {
           planeIndex: channel,
           format: "f32-planar",
         });
-        // Copy to the correct offset in the combined buffer
-        audioBuffer.getChannelData(channel).set(channelData, frameOffset);
+        audioBuffer.copyToChannel(channelData, channel);
       }
-      frameOffset += audioData.numberOfFrames;
+
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(gainNodeRef.current);
+
+      // Schedule at the correct time based on the chunk's timestamp
+      const startTime = Math.max(scheduledTime, currentAudioContextTime);
+      source.start(startTime);
+
       audioData.close();
     }
-    
-    // Create and schedule the combined audio source
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(gainNodeRef.current);
-
-    const startTime = Math.max(
-      nextAudioTimeRef.current,
-      audioContextRef.current.currentTime
-    );
-    source.start(startTime);
-
-    nextAudioTimeRef.current = startTime + audioBuffer.duration;
-    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
   const fillFrameBuffer = useCallback(async () => {
@@ -531,11 +531,14 @@ export function WebCodecsVideoPlayer({
       currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
     }
 
-    // Drop frames that are too far behind (more than FRAME_DROP_THRESHOLD microseconds)
-    // Find how many frames to drop, then use splice() once for better performance
-    let dropCount = 0;
     const buffer = frameBufferRef.current;
+    
+    // For super smooth playback: display frames at their proper time
+    // Don't aggressively drop frames - only drop if WAY behind
+    // This prevents the "sped up" feeling from dropping too many frames
+    let dropCount = 0;
     while (dropCount < buffer.length - 1) {
+      // Only drop frames that are VERY far behind (300ms+)
       if (currentMediaTime - buffer[dropCount].timestamp > FRAME_DROP_THRESHOLD) {
         dropCount++;
       } else {
@@ -550,29 +553,43 @@ export function WebCodecsVideoPlayer({
       droppedFramesRef.current += dropCount;
     }
 
-    const frame = chooseFrame(currentMediaTime);
+    // Simple frame selection: display the first frame in buffer if its time has come
+    // This ensures smooth, consistent frame pacing
+    let frameToDisplay: VideoFrame | null = null;
+    if (buffer.length > 0) {
+      const firstFrame = buffer[0];
+      // Display this frame if we've reached or passed its timestamp
+      // Allow a small tolerance (16ms = ~1 frame at 60fps) for smoother display
+      if (currentMediaTime >= firstFrame.timestamp - 16000) {
+        frameToDisplay = firstFrame;
+      }
+    }
 
-    if (frame) {
-      // Frame rate limiting: Only render if this is a new frame
-      // This saves CPU when display refresh rate > video frame rate (e.g., 60Hz display, 24fps video)
-      if (frame.timestamp !== lastRenderedTimestampRef.current) {
-        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    if (frameToDisplay) {
+      // Only render if this is a new frame (avoid re-rendering same frame)
+      if (frameToDisplay.timestamp !== lastRenderedTimestampRef.current) {
+        ctx.drawImage(frameToDisplay, 0, 0, canvas.width, canvas.height);
         framesRenderedRef.current++;
-        lastRenderedTimestampRef.current = frame.timestamp;
+        lastRenderedTimestampRef.current = frameToDisplay.timestamp;
+        
+        // Remove the displayed frame from buffer and close it
+        buffer.shift();
+        frameToDisplay.close();
       }
 
-      const currentTimeSeconds = frame.timestamp / 1_000_000;
+      const currentTimeSeconds = lastRenderedTimestampRef.current / 1_000_000;
       
       // Throttle state updates - only update currentTime every 100ms
       if (now - lastDebugUpdateRef.current > 100) {
         updateState({ currentTime: currentTimeSeconds, buffering: false });
       }
-    } else {
-      // Only update buffering state occasionally to avoid re-renders
+    } else if (buffer.length === 0) {
+      // Only show buffering if we have no frames at all
       if (now - lastDebugUpdateRef.current > 100) {
         updateState({ buffering: true });
       }
     }
+    // If we have frames but haven't reached their time yet, just wait (don't show buffering)
 
     // Throttle debug panel updates to every DEBUG_UPDATE_INTERVAL ms
     if (now - lastDebugUpdateRef.current > DEBUG_UPDATE_INTERVAL) {
@@ -595,7 +612,7 @@ export function WebCodecsVideoPlayer({
 
     // Don't call fillFrameBuffer/fillAudioBuffer here - use separate intervals
     animationFrameRef.current = requestAnimationFrame(renderLoop);
-  }, [chooseFrame, updateState, updateDebugState]);
+  }, [updateState, updateDebugState]);
 
   // Start separate intervals for buffer filling (decoupled from render loop)
   const startBufferIntervals = useCallback(() => {
@@ -646,32 +663,68 @@ export function WebCodecsVideoPlayer({
   const play = useCallback(async () => {
     if (isPlayingRef.current) return;
 
-    isPlayingRef.current = true;
-    updateState({ isPlaying: true });
+    // Show buffering state while we pre-fill buffers
+    updateState({ isPlaying: true, buffering: true });
 
     if (audioContextRef.current?.state === "suspended") {
       await audioContextRef.current.resume();
     }
 
-    // Initialize A/V sync timing
-    // audioStartTimeRef = current audioContext time
-    // mediaTimeOffsetRef = current media position in seconds
+    // Pre-fill buffers before starting playback for smooth start
+    // This is critical for preventing initial stuttering
+    let bufferAttempts = 0;
+    const maxBufferAttempts = 50; // Max 5 seconds of buffering (50 * 100ms)
+    
+    while (bufferAttempts < maxBufferAttempts) {
+      await fillFrameBuffer();
+      await fillAudioBuffer();
+      
+      const hasEnoughFrames = frameBufferRef.current.length >= MIN_FRAMES_BEFORE_PLAY;
+      const hasEnoughAudio = audioBufferQueueRef.current.length >= MIN_AUDIO_BEFORE_PLAY || !audioDecoderRef.current;
+      
+      if (hasEnoughFrames && hasEnoughAudio) {
+        break;
+      }
+      
+      // Wait a bit before trying again
+      await new Promise(resolve => setTimeout(resolve, 100));
+      bufferAttempts++;
+    }
+
+    // Now set isPlayingRef after buffers are ready
+    isPlayingRef.current = true;
+
+    // Initialize A/V sync timing AFTER buffers are filled
+    // audioStartTimeRef = current audioContext time when playback starts
+    // mediaTimeOffsetRef = media timestamp (in seconds) that corresponds to audioStartTimeRef
     if (audioContextRef.current) {
       audioStartTimeRef.current = audioContextRef.current.currentTime;
-      mediaTimeOffsetRef.current = mediaStartTimeRef.current / 1_000_000; // Convert from microseconds to seconds
+      // mediaStartTimeRef is in microseconds, convert to seconds for mediaTimeOffsetRef
+      // This represents the media position we're starting from
+      mediaTimeOffsetRef.current = mediaStartTimeRef.current / 1_000_000;
+      
+      // If we have frames in the buffer, use the first frame's timestamp as the starting point
+      // This ensures proper sync when the media doesn't start at timestamp 0
+      if (frameBufferRef.current.length > 0) {
+        const firstFrameTimestamp = frameBufferRef.current[0].timestamp / 1_000_000;
+        // Only use first frame timestamp if we're starting from the beginning
+        if (mediaTimeOffsetRef.current === 0 || mediaTimeOffsetRef.current < firstFrameTimestamp) {
+          mediaTimeOffsetRef.current = firstFrameTimestamp;
+          mediaStartTimeRef.current = firstFrameTimestamp * 1_000_000;
+        }
+      }
     }
     
-    nextAudioTimeRef.current = audioContextRef.current?.currentTime || 0;
     playbackStartTimeRef.current = performance.now();
-
-    // Initial buffer fill before starting playback
-    fillFrameBuffer();
-    fillAudioBuffer();
+    
+    // Schedule initial audio
     scheduleAudioPlayback();
 
     // Start separate intervals for continuous buffer filling
     startBufferIntervals();
 
+    // Clear buffering state and start render loop
+    updateState({ buffering: false });
     renderLoop();
   }, [renderLoop, fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback, startBufferIntervals, updateState]);
 
