@@ -496,9 +496,12 @@ export function WebCodecsVideoPlayer({
     }
 
     // Close and remove all frames before the best frame
-    for (let i = 0; i < bestIndex; i++) {
-      const staleFrame = buffer.shift();
-      staleFrame?.close();
+    // Use splice() once instead of multiple shift() calls for better performance
+    if (bestIndex > 0) {
+      const staleFrames = buffer.splice(0, bestIndex);
+      for (const frame of staleFrames) {
+        frame.close();
+      }
     }
 
     return buffer[0] || null;
