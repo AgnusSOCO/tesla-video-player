@@ -43,6 +43,7 @@ interface DebugState {
   audioBufferSize: number;
   chunksDecoded: number;
   framesRendered: number;
+  droppedFrames: number; // Track dropped frames for performance monitoring
   lastError: string | null;
   demuxerReady: boolean;
   videoSamplesReceived: number;
@@ -53,8 +54,15 @@ interface DebugState {
   audioIsEOF: boolean;
 }
 
-const FRAME_BUFFER_TARGET_SIZE = 10;
-const AUDIO_BUFFER_DURATION = 0.5;
+// Performance tuning constants
+const FRAME_BUFFER_TARGET_SIZE = 45; // Increased for smoother playback (1.5s at 30fps)
+const FRAME_BUFFER_MAX_SIZE = 90; // Hard limit to prevent memory issues (3s at 30fps)
+const AUDIO_SCHEDULE_AHEAD = 3.0; // Schedule 3 seconds of audio ahead for smoother playback
+const DEBUG_UPDATE_INTERVAL = 500; // Update debug panel every 500ms instead of every frame
+const FRAME_DROP_THRESHOLD = 150000; // Drop frames more than 150ms behind (in microseconds) - more lenient
+const VIDEO_FILL_INTERVAL = 30; // Fill video buffer every 30ms (more aggressive)
+const AUDIO_FILL_INTERVAL = 50; // Fill audio buffer every 50ms (more aggressive)
+const AUDIO_SCHEDULE_INTERVAL = 30; // Schedule audio every 30ms (more aggressive)
 
 export function WebCodecsVideoPlayer({
   videoUrl,
@@ -62,6 +70,7 @@ export function WebCodecsVideoPlayer({
   onClose,
 }: WebCodecsVideoPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null); // Cache canvas context
   const [state, setState] = useState<PlayerState>({
     isPlaying: false,
     isLoading: true,
@@ -79,6 +88,7 @@ export function WebCodecsVideoPlayer({
     audioBufferSize: 0,
     chunksDecoded: 0,
     framesRendered: 0,
+    droppedFrames: 0,
     lastError: null,
     demuxerReady: false,
     videoSamplesReceived: 0,
@@ -89,8 +99,13 @@ export function WebCodecsVideoPlayer({
     audioIsEOF: false,
   });
   const [showDebug, setShowDebug] = useState(true);
+  
+  // Performance tracking refs (avoid state updates)
   const chunksDecodedRef = useRef(0);
   const framesRenderedRef = useRef(0);
+  const droppedFramesRef = useRef(0);
+  const lastDebugUpdateRef = useRef(0);
+  const lastRenderedTimestampRef = useRef<number>(-1); // Track last rendered frame to avoid re-rendering same frame
 
   const videoDemuxerRef = useRef<MP4Demuxer | null>(null);
   const audioDemuxerRef = useRef<MP4Demuxer | null>(null);
@@ -110,6 +125,11 @@ export function WebCodecsVideoPlayer({
   const nextAudioTimeRef = useRef<number>(0);
   const isCleanedUpRef = useRef<boolean>(false);
   const needsKeyframeRef = useRef<boolean>(true); // After configure() or flush(), we need a keyframe
+  
+  // Separate intervals for buffer filling (don't tie to render loop)
+  const videoFillIntervalRef = useRef<number | null>(null);
+  const audioFillIntervalRef = useRef<number | null>(null);
+  const audioScheduleIntervalRef = useRef<number | null>(null);
   
   // A/V sync: Use audioContext.currentTime as master clock
   // audioStartTimeRef = audioContext.currentTime when playback started
@@ -141,10 +161,18 @@ export function WebCodecsVideoPlayer({
         throw new Error("Canvas not available");
       }
 
-      const ctx = canvas.getContext("2d");
+      // Optimize canvas for video playback:
+      // - alpha: false - no transparency needed, saves memory
+      // - desynchronized: true - reduces latency by not syncing with compositor
+      const ctx = canvas.getContext("2d", { 
+        alpha: false, 
+        desynchronized: true 
+      });
       if (!ctx) {
         throw new Error("Failed to get canvas 2D context");
       }
+      // Cache the context to avoid retrieving it every frame in renderLoop
+      canvasCtxRef.current = ctx;
 
       videoDemuxerRef.current = new MP4Demuxer(videoUrl);
       await videoDemuxerRef.current.initialize(VIDEO_STREAM_TYPE);
@@ -164,8 +192,17 @@ export function WebCodecsVideoPlayer({
 
       videoDecoderRef.current = new VideoDecoder({
         output: (frame: VideoFrame) => {
+          // Enforce hard limit to prevent memory issues and crashes
+          if (frameBufferRef.current.length >= FRAME_BUFFER_MAX_SIZE) {
+            // Drop oldest frame to make room
+            const oldFrame = frameBufferRef.current.shift();
+            if (oldFrame) {
+              oldFrame.close();
+              droppedFramesRef.current++;
+            }
+          }
           frameBufferRef.current.push(frame);
-          updateDebugState({ frameBufferSize: frameBufferRef.current.length });
+          // Don't update debug state here - too frequent, causes re-renders
         },
         error: (e: Error) => {
           console.error("VideoDecoder error:", e);
@@ -190,6 +227,7 @@ export function WebCodecsVideoPlayer({
         codedWidth: videoConfig.codedWidth,
         codedHeight: videoConfig.codedHeight,
         description: videoConfig.description,
+        hardwareAcceleration: "prefer-hardware", // Use GPU acceleration when available
       });
       updateDebugState({ videoDecoderState: "configured" });
 
@@ -213,8 +251,14 @@ export function WebCodecsVideoPlayer({
 
           audioDecoderRef.current = new AudioDecoder({
             output: (audioData: AudioData) => {
+              // Limit audio buffer to prevent memory issues (max 100 chunks)
+              const MAX_AUDIO_BUFFER = 100;
+              if (audioBufferQueueRef.current.length >= MAX_AUDIO_BUFFER) {
+                const oldData = audioBufferQueueRef.current.shift();
+                if (oldData) oldData.close();
+              }
               audioBufferQueueRef.current.push(audioData);
-              scheduleAudioPlayback();
+              // Don't call scheduleAudioPlayback here - use interval instead
             },
             error: (e: Error) => {
               console.error("AudioDecoder error:", e);
@@ -271,57 +315,67 @@ export function WebCodecsVideoPlayer({
     }
 
     // Schedule audio buffers ahead of time to prevent gaps
-    // Keep scheduling until we have at least 1.5 seconds of audio queued
-    // Increased from 0.5s to reduce choppiness
-    const minAudioAhead = 1.5;
+    // Keep scheduling until we have AUDIO_SCHEDULE_AHEAD seconds of audio queued
+    const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
+    if (audioAhead > AUDIO_SCHEDULE_AHEAD) return;
     
-    while (audioBufferQueueRef.current.length > 0) {
-      // Stop scheduling if we have enough audio queued ahead
-      const audioAhead = nextAudioTimeRef.current - audioContextRef.current.currentTime;
-      if (audioAhead > minAudioAhead) break;
-      
-      const audioData = audioBufferQueueRef.current.shift();
-      if (!audioData) continue;
-
-      const numberOfFrames = audioData.numberOfFrames;
-      const numberOfChannels = audioData.numberOfChannels;
-      const sampleRate = audioData.sampleRate;
-
-      const audioBuffer = audioContextRef.current.createBuffer(
-        numberOfChannels,
-        numberOfFrames,
-        sampleRate
-      );
-
+    // Batch multiple audio chunks together to reduce AudioBufferSourceNode creation overhead
+    // This significantly reduces CPU usage compared to creating one source per chunk
+    const BATCH_SIZE = 10; // Combine up to 10 chunks into one buffer
+    const chunksToProcess: AudioData[] = [];
+    
+    while (chunksToProcess.length < BATCH_SIZE && audioBufferQueueRef.current.length > 0) {
+      const chunk = audioBufferQueueRef.current.shift();
+      if (chunk) chunksToProcess.push(chunk);
+    }
+    
+    if (chunksToProcess.length === 0) return;
+    
+    // Calculate total frames needed for the combined buffer
+    let totalFrames = 0;
+    const sampleRate = chunksToProcess[0].sampleRate;
+    const numberOfChannels = chunksToProcess[0].numberOfChannels;
+    
+    for (const chunk of chunksToProcess) {
+      totalFrames += chunk.numberOfFrames;
+    }
+    
+    // Create a single larger buffer for all chunks
+    const audioBuffer = audioContextRef.current.createBuffer(
+      numberOfChannels,
+      totalFrames,
+      sampleRate
+    );
+    
+    // Copy all chunks into the combined buffer
+    let frameOffset = 0;
+    for (const audioData of chunksToProcess) {
       for (let channel = 0; channel < numberOfChannels; channel++) {
-        const channelData = new Float32Array(numberOfFrames);
+        const channelData = new Float32Array(audioData.numberOfFrames);
         audioData.copyTo(channelData, {
           planeIndex: channel,
           format: "f32-planar",
         });
-        audioBuffer.copyToChannel(channelData, channel);
+        // Copy to the correct offset in the combined buffer
+        audioBuffer.getChannelData(channel).set(channelData, frameOffset);
       }
-
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(gainNodeRef.current);
-
-      const startTime = Math.max(
-        nextAudioTimeRef.current,
-        audioContextRef.current.currentTime
-      );
-      source.start(startTime);
-
-      nextAudioTimeRef.current = startTime + audioBuffer.duration;
-
+      frameOffset += audioData.numberOfFrames;
       audioData.close();
     }
     
-    // Continue scheduling periodically if we're playing
-    // Reduced interval from 100ms to 50ms for more responsive scheduling
-    if (isPlayingRef.current && audioBufferQueueRef.current.length > 0) {
-      setTimeout(() => scheduleAudioPlayback(), 50);
-    }
+    // Create and schedule the combined audio source
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(gainNodeRef.current);
+
+    const startTime = Math.max(
+      nextAudioTimeRef.current,
+      audioContextRef.current.currentTime
+    );
+    source.start(startTime);
+
+    nextAudioTimeRef.current = startTime + audioBuffer.duration;
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
   const fillFrameBuffer = useCallback(async () => {
@@ -372,10 +426,7 @@ export function WebCodecsVideoPlayer({
     }
 
     fillInProgressRef.current = false;
-
-    if (!isCleanedUpRef.current && frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
-      setTimeout(() => fillFrameBuffer(), 10);
-    }
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, [updateDebugState]);
 
   const fillAudioBuffer = useCallback(async () => {
@@ -413,50 +464,61 @@ export function WebCodecsVideoPlayer({
     }
 
     audioFillInProgressRef.current = false;
-    
-    // Continue filling if we're still playing
-    // Reduced interval from 50ms to 20ms for faster buffer refilling
-    if (isPlayingRef.current && !isCleanedUpRef.current) {
-      setTimeout(() => fillAudioBuffer(), 20);
-    }
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
   const chooseFrame = useCallback((targetTimestamp: number): VideoFrame | null => {
-    if (frameBufferRef.current.length === 0) return null;
+    const buffer = frameBufferRef.current;
+    if (buffer.length === 0) return null;
 
-    let minTimeDelta = Number.MAX_VALUE;
-    let frameIndex = -1;
+    // Binary search for the frame closest to targetTimestamp
+    // Frames are sorted by timestamp in ascending order
+    let left = 0;
+    let right = buffer.length - 1;
+    let bestIndex = 0;
+    let bestDelta = Math.abs(targetTimestamp - buffer[0].timestamp);
 
-    for (let i = 0; i < frameBufferRef.current.length; i++) {
-      const timeDelta = Math.abs(
-        targetTimestamp - frameBufferRef.current[i].timestamp
-      );
-      if (timeDelta < minTimeDelta) {
-        minTimeDelta = timeDelta;
-        frameIndex = i;
+    while (left <= right) {
+      const mid = (left + right) >>> 1; // Faster than Math.floor
+      const delta = Math.abs(targetTimestamp - buffer[mid].timestamp);
+      
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestIndex = mid;
+      }
+      
+      if (buffer[mid].timestamp < targetTimestamp) {
+        left = mid + 1;
+      } else if (buffer[mid].timestamp > targetTimestamp) {
+        right = mid - 1;
       } else {
+        // Exact match
+        bestIndex = mid;
         break;
       }
     }
 
-    if (frameIndex === -1) return null;
-
-    for (let i = 0; i < frameIndex; i++) {
-      const staleFrame = frameBufferRef.current.shift();
-      staleFrame?.close();
+    // Close and remove all frames before the best frame
+    // Use splice() once instead of multiple shift() calls for better performance
+    if (bestIndex > 0) {
+      const staleFrames = buffer.splice(0, bestIndex);
+      for (const frame of staleFrames) {
+        frame.close();
+      }
     }
 
-    return frameBufferRef.current[0] || null;
+    return buffer[0] || null;
   }, []);
 
   const renderLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
 
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const ctx = canvasCtxRef.current; // Use cached context instead of retrieving every frame
+    if (!canvas || !ctx) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    // Get current time once at the start of the frame for consistency
+    const now = performance.now();
 
     // Use AudioContext as master clock for A/V sync
     // If no audio context, fall back to performance.now()
@@ -465,34 +527,62 @@ export function WebCodecsVideoPlayer({
       const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
       currentMediaTime = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000; // Convert to microseconds
     } else {
-      const elapsedTime = performance.now() - playbackStartTimeRef.current;
+      const elapsedTime = now - playbackStartTimeRef.current;
       currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
+    }
+
+    // Drop frames that are too far behind (more than FRAME_DROP_THRESHOLD microseconds)
+    // Find how many frames to drop, then use splice() once for better performance
+    let dropCount = 0;
+    const buffer = frameBufferRef.current;
+    while (dropCount < buffer.length - 1) {
+      if (currentMediaTime - buffer[dropCount].timestamp > FRAME_DROP_THRESHOLD) {
+        dropCount++;
+      } else {
+        break;
+      }
+    }
+    if (dropCount > 0) {
+      const droppedFrames = buffer.splice(0, dropCount);
+      for (const frame of droppedFrames) {
+        frame.close();
+      }
+      droppedFramesRef.current += dropCount;
     }
 
     const frame = chooseFrame(currentMediaTime);
 
-    const videoDebug = videoDemuxerRef.current?.getDebugInfo();
-    const audioDebug = audioDemuxerRef.current?.getDebugInfo();
-
     if (frame) {
-      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      framesRenderedRef.current++;
+      // Frame rate limiting: Only render if this is a new frame
+      // This saves CPU when display refresh rate > video frame rate (e.g., 60Hz display, 24fps video)
+      if (frame.timestamp !== lastRenderedTimestampRef.current) {
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        framesRenderedRef.current++;
+        lastRenderedTimestampRef.current = frame.timestamp;
+      }
 
       const currentTimeSeconds = frame.timestamp / 1_000_000;
-      updateState({ currentTime: currentTimeSeconds, buffering: false });
+      
+      // Throttle state updates - only update currentTime every 100ms
+      if (now - lastDebugUpdateRef.current > 100) {
+        updateState({ currentTime: currentTimeSeconds, buffering: false });
+      }
+    } else {
+      // Only update buffering state occasionally to avoid re-renders
+      if (now - lastDebugUpdateRef.current > 100) {
+        updateState({ buffering: true });
+      }
+    }
+
+    // Throttle debug panel updates to every DEBUG_UPDATE_INTERVAL ms
+    if (now - lastDebugUpdateRef.current > DEBUG_UPDATE_INTERVAL) {
+      lastDebugUpdateRef.current = now;
+      const videoDebug = videoDemuxerRef.current?.getDebugInfo();
+      const audioDebug = audioDemuxerRef.current?.getDebugInfo();
       updateDebugState({
         framesRendered: framesRenderedRef.current,
-        frameBufferSize: frameBufferRef.current.length,
-        videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
-        audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
-        videoTrackId: videoDebug?.trackId ?? null,
-        audioTrackId: audioDebug?.trackId ?? null,
-        videoIsEOF: videoDebug?.isEOF ?? false,
-        audioIsEOF: audioDebug?.isEOF ?? false,
-      });
-    } else {
-      updateState({ buffering: true });
-      updateDebugState({
+        chunksDecoded: chunksDecodedRef.current,
+        droppedFrames: droppedFramesRef.current,
         frameBufferSize: frameBufferRef.current.length,
         videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
         audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
@@ -503,11 +593,55 @@ export function WebCodecsVideoPlayer({
       });
     }
 
-    fillFrameBuffer();
-    fillAudioBuffer();
-
+    // Don't call fillFrameBuffer/fillAudioBuffer here - use separate intervals
     animationFrameRef.current = requestAnimationFrame(renderLoop);
-  }, [chooseFrame, fillFrameBuffer, fillAudioBuffer, updateState, updateDebugState]);
+  }, [chooseFrame, updateState, updateDebugState]);
+
+  // Start separate intervals for buffer filling (decoupled from render loop)
+  const startBufferIntervals = useCallback(() => {
+    // Video buffer filling - more aggressive for smoother playback
+    if (!videoFillIntervalRef.current) {
+      videoFillIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current && !isCleanedUpRef.current) {
+          fillFrameBuffer();
+        }
+      }, VIDEO_FILL_INTERVAL);
+    }
+    
+    // Audio buffer filling - more aggressive for smoother audio
+    if (!audioFillIntervalRef.current) {
+      audioFillIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current && !isCleanedUpRef.current) {
+          fillAudioBuffer();
+        }
+      }, AUDIO_FILL_INTERVAL);
+    }
+    
+    // Audio scheduling - more aggressive to prevent gaps
+    if (!audioScheduleIntervalRef.current) {
+      audioScheduleIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current && !isCleanedUpRef.current) {
+          scheduleAudioPlayback();
+        }
+      }, AUDIO_SCHEDULE_INTERVAL);
+    }
+  }, [fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback]);
+
+  // Stop all buffer filling intervals
+  const stopBufferIntervals = useCallback(() => {
+    if (videoFillIntervalRef.current) {
+      clearInterval(videoFillIntervalRef.current);
+      videoFillIntervalRef.current = null;
+    }
+    if (audioFillIntervalRef.current) {
+      clearInterval(audioFillIntervalRef.current);
+      audioFillIntervalRef.current = null;
+    }
+    if (audioScheduleIntervalRef.current) {
+      clearInterval(audioScheduleIntervalRef.current);
+      audioScheduleIntervalRef.current = null;
+    }
+  }, []);
 
   const play = useCallback(async () => {
     if (isPlayingRef.current) return;
@@ -530,15 +664,23 @@ export function WebCodecsVideoPlayer({
     nextAudioTimeRef.current = audioContextRef.current?.currentTime || 0;
     playbackStartTimeRef.current = performance.now();
 
+    // Initial buffer fill before starting playback
+    fillFrameBuffer();
     fillAudioBuffer();
     scheduleAudioPlayback();
 
+    // Start separate intervals for continuous buffer filling
+    startBufferIntervals();
+
     renderLoop();
-  }, [renderLoop, fillAudioBuffer, scheduleAudioPlayback, updateState]);
+  }, [renderLoop, fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback, startBufferIntervals, updateState]);
 
   const pause = useCallback(() => {
     isPlayingRef.current = false;
     updateState({ isPlaying: false });
+
+    // Stop buffer filling intervals
+    stopBufferIntervals();
 
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -557,7 +699,7 @@ export function WebCodecsVideoPlayer({
     if (audioContextRef.current?.state === "running") {
       audioContextRef.current.suspend();
     }
-  }, [updateState]);
+  }, [stopBufferIntervals, updateState]);
 
   const togglePlayPause = useCallback(() => {
     if (state.isPlaying) {
@@ -671,6 +813,20 @@ export function WebCodecsVideoPlayer({
       if (isCleanedUpRef.current) return;
       isCleanedUpRef.current = true;
       isPlayingRef.current = false;
+
+      // Clear buffer filling intervals
+      if (videoFillIntervalRef.current) {
+        clearInterval(videoFillIntervalRef.current);
+        videoFillIntervalRef.current = null;
+      }
+      if (audioFillIntervalRef.current) {
+        clearInterval(audioFillIntervalRef.current);
+        audioFillIntervalRef.current = null;
+      }
+      if (audioScheduleIntervalRef.current) {
+        clearInterval(audioScheduleIntervalRef.current);
+        audioScheduleIntervalRef.current = null;
+      }
 
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
@@ -797,6 +953,7 @@ export function WebCodecsVideoPlayer({
               <div>Frame Buffer: <span className={debugState.frameBufferSize > 0 ? "text-green-400" : "text-yellow-400"}>{debugState.frameBufferSize}</span></div>
               <div>Chunks Decoded: <span className="text-blue-400">{debugState.chunksDecoded}</span></div>
               <div>Frames Rendered: <span className="text-blue-400">{debugState.framesRendered}</span></div>
+              <div>Dropped Frames: <span className={debugState.droppedFrames > 0 ? "text-red-400" : "text-green-400"}>{debugState.droppedFrames}</span></div>
               <div>Buffering: <span className={state.buffering ? "text-yellow-400" : "text-green-400"}>{state.buffering ? "Yes" : "No"}</span></div>
               <div>Playing: <span className={state.isPlaying ? "text-green-400" : "text-gray-400"}>{state.isPlaying ? "Yes" : "No"}</span></div>
               {debugState.lastError && (
