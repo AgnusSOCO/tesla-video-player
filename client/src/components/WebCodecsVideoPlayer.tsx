@@ -55,11 +55,14 @@ interface DebugState {
 }
 
 // Performance tuning constants
-const FRAME_BUFFER_TARGET_SIZE = 30; // Increased for smoother playback
-const FRAME_BUFFER_MAX_SIZE = 60; // Hard limit to prevent memory issues
-const AUDIO_SCHEDULE_AHEAD = 2.0; // Schedule 2 seconds of audio ahead
+const FRAME_BUFFER_TARGET_SIZE = 45; // Increased for smoother playback (1.5s at 30fps)
+const FRAME_BUFFER_MAX_SIZE = 90; // Hard limit to prevent memory issues (3s at 30fps)
+const AUDIO_SCHEDULE_AHEAD = 3.0; // Schedule 3 seconds of audio ahead for smoother playback
 const DEBUG_UPDATE_INTERVAL = 500; // Update debug panel every 500ms instead of every frame
-const FRAME_DROP_THRESHOLD = 100000; // Drop frames more than 100ms behind (in microseconds)
+const FRAME_DROP_THRESHOLD = 150000; // Drop frames more than 150ms behind (in microseconds) - more lenient
+const VIDEO_FILL_INTERVAL = 30; // Fill video buffer every 30ms (more aggressive)
+const AUDIO_FILL_INTERVAL = 50; // Fill audio buffer every 50ms (more aggressive)
+const AUDIO_SCHEDULE_INTERVAL = 30; // Schedule audio every 30ms (more aggressive)
 
 export function WebCodecsVideoPlayer({
   videoUrl,
@@ -596,31 +599,31 @@ export function WebCodecsVideoPlayer({
 
   // Start separate intervals for buffer filling (decoupled from render loop)
   const startBufferIntervals = useCallback(() => {
-    // Video buffer filling every 50ms
+    // Video buffer filling - more aggressive for smoother playback
     if (!videoFillIntervalRef.current) {
       videoFillIntervalRef.current = window.setInterval(() => {
         if (isPlayingRef.current && !isCleanedUpRef.current) {
           fillFrameBuffer();
         }
-      }, 50);
+      }, VIDEO_FILL_INTERVAL);
     }
     
-    // Audio buffer filling every 100ms
+    // Audio buffer filling - more aggressive for smoother audio
     if (!audioFillIntervalRef.current) {
       audioFillIntervalRef.current = window.setInterval(() => {
         if (isPlayingRef.current && !isCleanedUpRef.current) {
           fillAudioBuffer();
         }
-      }, 100);
+      }, AUDIO_FILL_INTERVAL);
     }
     
-    // Audio scheduling every 50ms
+    // Audio scheduling - more aggressive to prevent gaps
     if (!audioScheduleIntervalRef.current) {
       audioScheduleIntervalRef.current = window.setInterval(() => {
         if (isPlayingRef.current && !isCleanedUpRef.current) {
           scheduleAudioPlayback();
         }
-      }, 50);
+      }, AUDIO_SCHEDULE_INTERVAL);
     }
   }, [fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback]);
 
