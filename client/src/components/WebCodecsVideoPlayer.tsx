@@ -529,15 +529,22 @@ export function WebCodecsVideoPlayer({
     }
 
     // Drop frames that are too far behind (more than FRAME_DROP_THRESHOLD microseconds)
-    while (frameBufferRef.current.length > 1) {
-      const oldestFrame = frameBufferRef.current[0];
-      if (currentMediaTime - oldestFrame.timestamp > FRAME_DROP_THRESHOLD) {
-        frameBufferRef.current.shift();
-        oldestFrame.close();
-        droppedFramesRef.current++;
+    // Find how many frames to drop, then use splice() once for better performance
+    let dropCount = 0;
+    const buffer = frameBufferRef.current;
+    while (dropCount < buffer.length - 1) {
+      if (currentMediaTime - buffer[dropCount].timestamp > FRAME_DROP_THRESHOLD) {
+        dropCount++;
       } else {
         break;
       }
+    }
+    if (dropCount > 0) {
+      const droppedFrames = buffer.splice(0, dropCount);
+      for (const frame of droppedFrames) {
+        frame.close();
+      }
+      droppedFramesRef.current += dropCount;
     }
 
     const frame = chooseFrame(currentMediaTime);
