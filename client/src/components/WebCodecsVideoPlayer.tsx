@@ -102,6 +102,7 @@ export function WebCodecsVideoPlayer({
   const framesRenderedRef = useRef(0);
   const droppedFramesRef = useRef(0);
   const lastDebugUpdateRef = useRef(0);
+  const lastRenderedTimestampRef = useRef<number>(-1); // Track last rendered frame to avoid re-rendering same frame
 
   const videoDemuxerRef = useRef<MP4Demuxer | null>(null);
   const audioDemuxerRef = useRef<MP4Demuxer | null>(null);
@@ -510,6 +511,9 @@ export function WebCodecsVideoPlayer({
     const ctx = canvasCtxRef.current; // Use cached context instead of retrieving every frame
     if (!canvas || !ctx) return;
 
+    // Get current time once at the start of the frame for consistency
+    const now = performance.now();
+
     // Use AudioContext as master clock for A/V sync
     // If no audio context, fall back to performance.now()
     let currentMediaTime: number;
@@ -517,7 +521,7 @@ export function WebCodecsVideoPlayer({
       const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
       currentMediaTime = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000; // Convert to microseconds
     } else {
-      const elapsedTime = performance.now() - playbackStartTimeRef.current;
+      const elapsedTime = now - playbackStartTimeRef.current;
       currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
     }
 
@@ -536,26 +540,28 @@ export function WebCodecsVideoPlayer({
     const frame = chooseFrame(currentMediaTime);
 
     if (frame) {
-      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      framesRenderedRef.current++;
+      // Frame rate limiting: Only render if this is a new frame
+      // This saves CPU when display refresh rate > video frame rate (e.g., 60Hz display, 24fps video)
+      if (frame.timestamp !== lastRenderedTimestampRef.current) {
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        framesRenderedRef.current++;
+        lastRenderedTimestampRef.current = frame.timestamp;
+      }
 
       const currentTimeSeconds = frame.timestamp / 1_000_000;
       
       // Throttle state updates - only update currentTime every 100ms
-      const now = performance.now();
       if (now - lastDebugUpdateRef.current > 100) {
         updateState({ currentTime: currentTimeSeconds, buffering: false });
       }
     } else {
       // Only update buffering state occasionally to avoid re-renders
-      const now = performance.now();
       if (now - lastDebugUpdateRef.current > 100) {
         updateState({ buffering: true });
       }
     }
 
     // Throttle debug panel updates to every DEBUG_UPDATE_INTERVAL ms
-    const now = performance.now();
     if (now - lastDebugUpdateRef.current > DEBUG_UPDATE_INTERVAL) {
       lastDebugUpdateRef.current = now;
       const videoDebug = videoDemuxerRef.current?.getDebugInfo();
