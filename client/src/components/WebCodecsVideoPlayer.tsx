@@ -66,6 +66,7 @@ export function WebCodecsVideoPlayer({
   onClose,
 }: WebCodecsVideoPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null); // Cache canvas context
   const [state, setState] = useState<PlayerState>({
     isPlaying: false,
     isLoading: true,
@@ -154,10 +155,18 @@ export function WebCodecsVideoPlayer({
         throw new Error("Canvas not available");
       }
 
-      const ctx = canvas.getContext("2d");
+      // Optimize canvas for video playback:
+      // - alpha: false - no transparency needed, saves memory
+      // - desynchronized: true - reduces latency by not syncing with compositor
+      const ctx = canvas.getContext("2d", { 
+        alpha: false, 
+        desynchronized: true 
+      });
       if (!ctx) {
         throw new Error("Failed to get canvas 2D context");
       }
+      // Cache the context to avoid retrieving it every frame in renderLoop
+      canvasCtxRef.current = ctx;
 
       videoDemuxerRef.current = new MP4Demuxer(videoUrl);
       await videoDemuxerRef.current.initialize(VIDEO_STREAM_TYPE);
@@ -212,6 +221,7 @@ export function WebCodecsVideoPlayer({
         codedWidth: videoConfig.codedWidth,
         codedHeight: videoConfig.codedHeight,
         description: videoConfig.description,
+        hardwareAcceleration: "prefer-hardware", // Use GPU acceleration when available
       });
       updateDebugState({ videoDecoderState: "configured" });
 
@@ -344,12 +354,7 @@ export function WebCodecsVideoPlayer({
 
       audioData.close();
     }
-    
-    // Continue scheduling periodically if we're playing
-    // Reduced interval from 100ms to 50ms for more responsive scheduling
-    if (isPlayingRef.current && audioBufferQueueRef.current.length > 0) {
-      setTimeout(() => scheduleAudioPlayback(), 50);
-    }
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
   const fillFrameBuffer = useCallback(async () => {
@@ -400,10 +405,7 @@ export function WebCodecsVideoPlayer({
     }
 
     fillInProgressRef.current = false;
-
-    if (!isCleanedUpRef.current && frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE) {
-      setTimeout(() => fillFrameBuffer(), 10);
-    }
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, [updateDebugState]);
 
   const fillAudioBuffer = useCallback(async () => {
@@ -441,50 +443,55 @@ export function WebCodecsVideoPlayer({
     }
 
     audioFillInProgressRef.current = false;
-    
-    // Continue filling if we're still playing
-    // Reduced interval from 50ms to 20ms for faster buffer refilling
-    if (isPlayingRef.current && !isCleanedUpRef.current) {
-      setTimeout(() => fillAudioBuffer(), 20);
-    }
+    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, []);
 
   const chooseFrame = useCallback((targetTimestamp: number): VideoFrame | null => {
-    if (frameBufferRef.current.length === 0) return null;
+    const buffer = frameBufferRef.current;
+    if (buffer.length === 0) return null;
 
-    let minTimeDelta = Number.MAX_VALUE;
-    let frameIndex = -1;
+    // Binary search for the frame closest to targetTimestamp
+    // Frames are sorted by timestamp in ascending order
+    let left = 0;
+    let right = buffer.length - 1;
+    let bestIndex = 0;
+    let bestDelta = Math.abs(targetTimestamp - buffer[0].timestamp);
 
-    for (let i = 0; i < frameBufferRef.current.length; i++) {
-      const timeDelta = Math.abs(
-        targetTimestamp - frameBufferRef.current[i].timestamp
-      );
-      if (timeDelta < minTimeDelta) {
-        minTimeDelta = timeDelta;
-        frameIndex = i;
+    while (left <= right) {
+      const mid = (left + right) >>> 1; // Faster than Math.floor
+      const delta = Math.abs(targetTimestamp - buffer[mid].timestamp);
+      
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestIndex = mid;
+      }
+      
+      if (buffer[mid].timestamp < targetTimestamp) {
+        left = mid + 1;
+      } else if (buffer[mid].timestamp > targetTimestamp) {
+        right = mid - 1;
       } else {
+        // Exact match
+        bestIndex = mid;
         break;
       }
     }
 
-    if (frameIndex === -1) return null;
-
-    for (let i = 0; i < frameIndex; i++) {
-      const staleFrame = frameBufferRef.current.shift();
+    // Close and remove all frames before the best frame
+    for (let i = 0; i < bestIndex; i++) {
+      const staleFrame = buffer.shift();
       staleFrame?.close();
     }
 
-    return frameBufferRef.current[0] || null;
+    return buffer[0] || null;
   }, []);
 
   const renderLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
 
     const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    const ctx = canvasCtxRef.current; // Use cached context instead of retrieving every frame
+    if (!canvas || !ctx) return;
 
     // Use AudioContext as master clock for A/V sync
     // If no audio context, fall back to performance.now()
