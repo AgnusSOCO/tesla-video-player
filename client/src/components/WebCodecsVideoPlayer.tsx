@@ -319,53 +319,68 @@ export function WebCodecsVideoPlayer({
 
     const currentAudioContextTime = audioContextRef.current.currentTime;
     
-    // Simple sequential audio scheduling for smooth playback
-    // Schedule audio chunks one after another, keeping track of when the next one should play
-    // This is more reliable than timestamp-based scheduling which can skip chunks
+    // Don't schedule too far ahead
+    const audioAhead = nextAudioTimeRef.current - currentAudioContextTime;
+    if (audioAhead > AUDIO_SCHEDULE_AHEAD) {
+      return;
+    }
     
-    while (audioBufferQueueRef.current.length > 0) {
-      // Don't schedule too far ahead
-      const audioAhead = nextAudioTimeRef.current - currentAudioContextTime;
-      if (audioAhead > AUDIO_SCHEDULE_AHEAD) {
-        break;
-      }
-      
-      const audioData = audioBufferQueueRef.current.shift();
-      if (!audioData) break;
-
-      const numberOfFrames = audioData.numberOfFrames;
-      const numberOfChannels = audioData.numberOfChannels;
-      const sampleRate = audioData.sampleRate;
-
-      const audioBuffer = audioContextRef.current.createBuffer(
-        numberOfChannels,
-        numberOfFrames,
-        sampleRate
-      );
-
+    // BATCH multiple audio chunks into larger buffers for seamless playback
+    // Creating many small AudioBufferSourceNodes causes gaps between chunks
+    // By combining chunks into larger buffers, we eliminate these gaps
+    const BATCH_SIZE = 20; // Combine up to 20 chunks (~0.5s of audio at typical chunk sizes)
+    const chunksToProcess: AudioData[] = [];
+    
+    while (chunksToProcess.length < BATCH_SIZE && audioBufferQueueRef.current.length > 0) {
+      const chunk = audioBufferQueueRef.current.shift();
+      if (chunk) chunksToProcess.push(chunk);
+    }
+    
+    if (chunksToProcess.length === 0) return;
+    
+    // Calculate total frames needed for the combined buffer
+    let totalFrames = 0;
+    const sampleRate = chunksToProcess[0].sampleRate;
+    const numberOfChannels = chunksToProcess[0].numberOfChannels;
+    
+    for (const chunk of chunksToProcess) {
+      totalFrames += chunk.numberOfFrames;
+    }
+    
+    // Create a single larger buffer for all chunks - this eliminates gaps
+    const combinedBuffer = audioContextRef.current.createBuffer(
+      numberOfChannels,
+      totalFrames,
+      sampleRate
+    );
+    
+    // Copy all chunks into the combined buffer sequentially
+    let frameOffset = 0;
+    for (const audioData of chunksToProcess) {
       for (let channel = 0; channel < numberOfChannels; channel++) {
-        const channelData = new Float32Array(numberOfFrames);
+        const channelData = new Float32Array(audioData.numberOfFrames);
         audioData.copyTo(channelData, {
           planeIndex: channel,
           format: "f32-planar",
         });
-        audioBuffer.copyToChannel(channelData, channel);
+        // Copy to the correct offset in the combined buffer
+        combinedBuffer.getChannelData(channel).set(channelData, frameOffset);
       }
-
-      const source = audioContextRef.current.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(gainNodeRef.current);
-
-      // Schedule sequentially: each chunk plays right after the previous one
-      // If we're behind, start immediately
-      const startTime = Math.max(nextAudioTimeRef.current, currentAudioContextTime);
-      source.start(startTime);
-      
-      // Update next audio time for the following chunk
-      nextAudioTimeRef.current = startTime + audioBuffer.duration;
-
+      frameOffset += audioData.numberOfFrames;
       audioData.close();
     }
+    
+    // Create and schedule the combined audio source
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = combinedBuffer;
+    source.connect(gainNodeRef.current);
+
+    // Schedule sequentially: this buffer plays right after the previous one
+    const startTime = Math.max(nextAudioTimeRef.current, currentAudioContextTime);
+    source.start(startTime);
+    
+    // Update next audio time for the following batch
+    nextAudioTimeRef.current = startTime + combinedBuffer.duration;
   }, []);
 
   const fillFrameBuffer = useCallback(async () => {
