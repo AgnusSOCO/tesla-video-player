@@ -66,6 +66,10 @@ const MIN_FRAMES_BEFORE_PLAY = 20; // Wait for at least 20 frames before startin
 // This eliminates gaps caused by scheduling multiple AudioBufferSourceNodes
 const AUDIO_PREDECODE_CHUNKS = 500; // Pre-decode up to 500 chunks before playback (~10+ seconds)
 
+// Decoder queue management - prevent overwhelming the decoder
+const MAX_VIDEO_DECODE_QUEUE_SIZE = 10; // Don't queue more than 10 chunks at once
+const MAX_AUDIO_DECODE_QUEUE_SIZE = 50; // Audio chunks are smaller, can queue more
+
 export function WebCodecsVideoPlayer({
   videoUrl,
   title,
@@ -172,9 +176,11 @@ export function WebCodecsVideoPlayer({
       // Optimize canvas for video playback:
       // - alpha: false - no transparency needed, saves memory
       // - desynchronized: true - reduces latency by not syncing with compositor
+      // - willReadFrequently: false - hints GPU acceleration for write-heavy operations
       const ctx = canvas.getContext("2d", { 
         alpha: false, 
-        desynchronized: true 
+        desynchronized: true,
+        willReadFrequently: false,
       });
       if (!ctx) {
         throw new Error("Failed to get canvas 2D context");
@@ -426,11 +432,13 @@ export function WebCodecsVideoPlayer({
     fillInProgressRef.current = true;
 
     try {
+      // PERFORMANCE: Limit decode queue size to prevent overwhelming the decoder
+      // This improves responsiveness and reduces memory pressure
       while (
         frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE &&
         videoDecoderRef.current &&
         videoDecoderRef.current.state !== "closed" &&
-        videoDecoderRef.current.decodeQueueSize < FRAME_BUFFER_TARGET_SIZE * 2
+        videoDecoderRef.current.decodeQueueSize < MAX_VIDEO_DECODE_QUEUE_SIZE
       ) {
         const chunk = await videoDemuxerRef.current.getNextChunk();
         if (!chunk) break;
@@ -484,8 +492,8 @@ export function WebCodecsVideoPlayer({
         if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
         if (isCleanedUpRef.current) break;
         
-        // Wait for decoder queue to have space
-        while (audioDecoderRef.current.decodeQueueSize > 50) {
+        // Wait for decoder queue to have space - prevents overwhelming the decoder
+        while (audioDecoderRef.current.decodeQueueSize > MAX_AUDIO_DECODE_QUEUE_SIZE) {
           await new Promise(resolve => setTimeout(resolve, 10));
           if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
         }
@@ -618,11 +626,14 @@ export function WebCodecsVideoPlayer({
     if (frameToDisplay) {
       // Only render if this is a new frame (avoid re-rendering same frame)
       if (frameToDisplay.timestamp !== lastRenderedTimestampRef.current) {
-        ctx.drawImage(frameToDisplay, 0, 0, canvas.width, canvas.height);
+        // PERFORMANCE: Use integer coordinates to avoid sub-pixel rendering overhead
+        // Sub-pixel rendering forces anti-aliasing calculations which are expensive
+        ctx.drawImage(frameToDisplay, 0, 0, canvas.width | 0, canvas.height | 0);
         framesRenderedRef.current++;
         lastRenderedTimestampRef.current = frameToDisplay.timestamp;
         
-        // Remove the displayed frame from buffer and close it
+        // Remove the displayed frame from buffer and close it immediately
+        // This is critical for memory management - VideoFrames hold GPU resources
         buffer.shift();
         frameToDisplay.close();
       }
