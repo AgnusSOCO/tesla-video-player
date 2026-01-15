@@ -43,7 +43,7 @@ interface DebugState {
   audioBufferSize: number;
   chunksDecoded: number;
   framesRendered: number;
-  droppedFrames: number; // Track dropped frames for performance monitoring
+  droppedFrames: number;
   lastError: string | null;
   demuxerReady: boolean;
   videoSamplesReceived: number;
@@ -54,21 +54,25 @@ interface DebugState {
   audioIsEOF: boolean;
 }
 
-// Performance tuning constants - optimized for super smooth playback
-const FRAME_BUFFER_TARGET_SIZE = 60; // 2 seconds at 30fps - large buffer for smooth playback
-const FRAME_BUFFER_MAX_SIZE = 120; // Hard limit to prevent memory issues (4s at 30fps)
-const DEBUG_UPDATE_INTERVAL = 500; // Update debug panel every 500ms instead of every frame
-const FRAME_DROP_THRESHOLD = 300000; // Drop frames more than 300ms behind (in microseconds) - very lenient
-const VIDEO_FILL_INTERVAL = 50; // Fill video buffer every 50ms
-const MIN_FRAMES_BEFORE_PLAY = 20; // Wait for at least 20 frames before starting playback
+// SIMPLIFIED APPROACH: Focus on reliability over complex optimizations
+// Key principles:
+// 1. Stream audio in chunks with scheduled playback (not pre-decode everything)
+// 2. Simple video rendering at consistent frame rate
+// 3. Audio is master clock for A/V sync
 
-// SINGLE BUFFER AUDIO APPROACH: Pre-decode ALL audio into one continuous buffer
-// This eliminates gaps caused by scheduling multiple AudioBufferSourceNodes
-const AUDIO_PREDECODE_CHUNKS = 500; // Pre-decode up to 500 chunks before playback (~10+ seconds)
+// Video buffer settings
+const FRAME_BUFFER_TARGET = 30; // 1 second at 30fps
+const FRAME_BUFFER_MAX = 60; // 2 seconds max
+const VIDEO_DECODE_BATCH = 5; // Decode 5 chunks at a time
 
-// Decoder queue management - prevent overwhelming the decoder
-const MAX_VIDEO_DECODE_QUEUE_SIZE = 10; // Don't queue more than 10 chunks at once
-const MAX_AUDIO_DECODE_QUEUE_SIZE = 50; // Audio chunks are smaller, can queue more
+// Audio buffer settings - STREAMING APPROACH
+const AUDIO_BUFFER_COUNT = 20; // Keep 20 audio buffers ready
+const AUDIO_SCHEDULE_AHEAD = 0.5; // Schedule audio 0.5 seconds ahead
+
+// Timing
+const RENDER_INTERVAL = 33; // ~30fps
+const BUFFER_FILL_INTERVAL = 100; // Fill buffers every 100ms
+const DEBUG_UPDATE_INTERVAL = 500;
 
 export function WebCodecsVideoPlayer({
   videoUrl,
@@ -76,7 +80,8 @@ export function WebCodecsVideoPlayer({
   onClose,
 }: WebCodecsVideoPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null); // Cache canvas context
+  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  
   const [state, setState] = useState<PlayerState>({
     isPlaying: false,
     isLoading: true,
@@ -87,6 +92,7 @@ export function WebCodecsVideoPlayer({
     isMuted: false,
     buffering: false,
   });
+  
   const [debugState, setDebugState] = useState<DebugState>({
     videoDecoderState: "unconfigured",
     audioDecoderState: "unconfigured",
@@ -104,15 +110,10 @@ export function WebCodecsVideoPlayer({
     videoIsEOF: false,
     audioIsEOF: false,
   });
-  const [showDebug, setShowDebug] = useState(true);
   
-  // Performance tracking refs (avoid state updates)
-  const chunksDecodedRef = useRef(0);
-  const framesRenderedRef = useRef(0);
-  const droppedFramesRef = useRef(0);
-  const lastDebugUpdateRef = useRef(0);
-  const lastRenderedTimestampRef = useRef<number>(-1); // Track last rendered frame to avoid re-rendering same frame
+  const [showDebug, setShowDebug] = useState(true);
 
+  // Refs for demuxers and decoders
   const videoDemuxerRef = useRef<MP4Demuxer | null>(null);
   const audioDemuxerRef = useRef<MP4Demuxer | null>(null);
   const videoDecoderRef = useRef<VideoDecoder | null>(null);
@@ -120,34 +121,36 @@ export function WebCodecsVideoPlayer({
   const audioContextRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
 
+  // Video frame buffer
   const frameBufferRef = useRef<VideoFrame[]>([]);
-  const audioBufferQueueRef = useRef<AudioData[]>([]);
-  const animationFrameRef = useRef<number | null>(null);
-  const playbackStartTimeRef = useRef<number>(0);
-  const mediaStartTimeRef = useRef<number>(0);
+  
+  // Audio buffer queue - stores decoded AudioBuffers for scheduling
+  const audioBufferQueueRef = useRef<AudioBuffer[]>([]);
+  const nextAudioTimeRef = useRef<number>(0); // Next AudioContext time to schedule audio
+  
+  // Playback state
   const isPlayingRef = useRef<boolean>(false);
-  const fillInProgressRef = useRef<boolean>(false);
-  const audioFillInProgressRef = useRef<boolean>(false);
   const isCleanedUpRef = useRef<boolean>(false);
-  const needsKeyframeRef = useRef<boolean>(true); // After configure() or flush(), we need a keyframe
+  const needsKeyframeRef = useRef<boolean>(true);
   
-  // Separate intervals for buffer filling (don't tie to render loop)
-  const videoFillIntervalRef = useRef<number | null>(null);
+  // Timing refs
+  const playbackStartTimeRef = useRef<number>(0); // AudioContext time when playback started
+  const mediaStartTimeRef = useRef<number>(0); // Media time (microseconds) when playback started
   
-  // SINGLE BUFFER AUDIO: Store the entire decoded audio as one continuous buffer
-  // This eliminates gaps caused by scheduling multiple AudioBufferSourceNodes
-  const fullAudioBufferRef = useRef<AudioBuffer | null>(null);
-  const audioSourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioDecodedSamplesRef = useRef<Float32Array[]>([]); // Accumulate decoded samples per channel
+  // Intervals
+  const renderIntervalRef = useRef<number | null>(null);
+  const bufferFillIntervalRef = useRef<number | null>(null);
+  const audioScheduleIntervalRef = useRef<number | null>(null);
+  
+  // Stats
+  const chunksDecodedRef = useRef(0);
+  const framesRenderedRef = useRef(0);
+  const droppedFramesRef = useRef(0);
+  const lastDebugUpdateRef = useRef(0);
+  
+  // Audio config
   const audioSampleRateRef = useRef<number>(44100);
   const audioChannelsRef = useRef<number>(2);
-  const audioReadyRef = useRef<boolean>(false);
-  
-  // A/V sync: Use audioContext.currentTime as master clock
-  // audioStartTimeRef = audioContext.currentTime when playback started
-  // mediaTimeOffsetRef = media timestamp (in seconds) at audioStartTimeRef
-  const audioStartTimeRef = useRef<number>(0);
-  const mediaTimeOffsetRef = useRef<number>(0);
 
   const updateState = useCallback((updates: Partial<PlayerState>) => {
     setState((prev) => ({ ...prev, ...updates }));
@@ -157,15 +160,227 @@ export function WebCodecsVideoPlayer({
     setDebugState((prev) => ({ ...prev, ...updates }));
   }, []);
 
+  // Convert AudioData to AudioBuffer for Web Audio API
+  const audioDataToBuffer = useCallback((audioData: AudioData): AudioBuffer | null => {
+    if (!audioContextRef.current) return null;
+    
+    const numberOfFrames = audioData.numberOfFrames;
+    const numberOfChannels = audioData.numberOfChannels;
+    const sampleRate = audioData.sampleRate;
+    
+    try {
+      const buffer = audioContextRef.current.createBuffer(
+        numberOfChannels,
+        numberOfFrames,
+        sampleRate
+      );
+      
+      for (let channel = 0; channel < numberOfChannels; channel++) {
+        const channelData = new Float32Array(numberOfFrames);
+        audioData.copyTo(channelData, {
+          planeIndex: channel,
+          format: "f32-planar",
+        });
+        buffer.copyToChannel(channelData, channel);
+      }
+      
+      return buffer;
+    } catch (e) {
+      console.error("Error converting AudioData to AudioBuffer:", e);
+      return null;
+    }
+  }, []);
+
+  // Schedule audio buffers for playback
+  const scheduleAudioBuffers = useCallback(() => {
+    if (!audioContextRef.current || !gainNodeRef.current || !isPlayingRef.current) return;
+    
+    const ctx = audioContextRef.current;
+    const currentTime = ctx.currentTime;
+    
+    // Calculate how far ahead we need to schedule
+    const scheduleUntil = currentTime + AUDIO_SCHEDULE_AHEAD;
+    
+    // Schedule pending audio buffers
+    while (audioBufferQueueRef.current.length > 0 && nextAudioTimeRef.current < scheduleUntil) {
+      const buffer = audioBufferQueueRef.current.shift();
+      if (!buffer) break;
+      
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gainNodeRef.current);
+      
+      // Schedule at the next audio time
+      const startTime = Math.max(nextAudioTimeRef.current, currentTime);
+      source.start(startTime);
+      
+      // Update next audio time
+      nextAudioTimeRef.current = startTime + buffer.duration;
+    }
+  }, []);
+
+  // Fill video frame buffer
+  const fillVideoBuffer = useCallback(async () => {
+    if (isCleanedUpRef.current) return;
+    if (!videoDemuxerRef.current || !videoDecoderRef.current) return;
+    if (videoDecoderRef.current.state === "closed") return;
+    if (frameBufferRef.current.length >= FRAME_BUFFER_TARGET) return;
+
+    try {
+      let decoded = 0;
+      while (
+        decoded < VIDEO_DECODE_BATCH &&
+        frameBufferRef.current.length < FRAME_BUFFER_MAX &&
+        videoDecoderRef.current &&
+        videoDecoderRef.current.state !== "closed"
+      ) {
+        const chunk = await videoDemuxerRef.current.getNextChunk();
+        if (!chunk) break;
+        if (isCleanedUpRef.current) break;
+
+        const videoChunk = chunk as EncodedVideoChunk;
+        
+        // Skip until we get a keyframe after configure/flush
+        if (needsKeyframeRef.current) {
+          if (videoChunk.type !== "key") continue;
+          needsKeyframeRef.current = false;
+        }
+
+        videoDecoderRef.current.decode(videoChunk);
+        chunksDecodedRef.current++;
+        decoded++;
+      }
+    } catch (err) {
+      console.error("Error filling video buffer:", err);
+      updateDebugState({ lastError: `fillVideoBuffer: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  }, [updateDebugState]);
+
+  // Fill audio buffer
+  const fillAudioBuffer = useCallback(async () => {
+    if (isCleanedUpRef.current) return;
+    if (!audioDemuxerRef.current || !audioDecoderRef.current) return;
+    if (audioDecoderRef.current.state === "closed") return;
+    if (audioBufferQueueRef.current.length >= AUDIO_BUFFER_COUNT) return;
+
+    try {
+      // Decode a batch of audio chunks
+      let decoded = 0;
+      while (decoded < 10 && audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
+        // Wait if decoder queue is too full
+        if (audioDecoderRef.current.decodeQueueSize > 20) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          continue;
+        }
+        
+        const chunk = await audioDemuxerRef.current.getNextChunk();
+        if (!chunk) break;
+        if (isCleanedUpRef.current) break;
+
+        audioDecoderRef.current.decode(chunk as EncodedAudioChunk);
+        decoded++;
+      }
+    } catch (err) {
+      console.error("Error filling audio buffer:", err);
+    }
+  }, []);
+
+  // Get current media time based on audio context
+  const getCurrentMediaTime = useCallback((): number => {
+    if (!audioContextRef.current || !isPlayingRef.current) {
+      return mediaStartTimeRef.current;
+    }
+    
+    const audioElapsed = audioContextRef.current.currentTime - playbackStartTimeRef.current;
+    return mediaStartTimeRef.current + audioElapsed * 1_000_000; // Convert to microseconds
+  }, []);
+
+  // Render video frame
+  const renderFrame = useCallback(() => {
+    if (!isPlayingRef.current || isCleanedUpRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const ctx = canvasCtxRef.current;
+    if (!canvas || !ctx) return;
+    
+    const buffer = frameBufferRef.current;
+    if (buffer.length === 0) {
+      updateState({ buffering: true });
+      return;
+    }
+    
+    const currentMediaTime = getCurrentMediaTime();
+    
+    // Find the best frame to display (closest to current time, but not in the future)
+    let bestFrameIndex = -1;
+    let bestFrameTime = -Infinity;
+    
+    for (let i = 0; i < buffer.length; i++) {
+      const frameTime = buffer[i].timestamp;
+      if (frameTime <= currentMediaTime && frameTime > bestFrameTime) {
+        bestFrameIndex = i;
+        bestFrameTime = frameTime;
+      }
+    }
+    
+    // If no frame is ready yet, wait
+    if (bestFrameIndex === -1) {
+      // Check if we're too far behind - use first frame
+      if (buffer.length > 0 && buffer[0].timestamp > currentMediaTime + 100000) {
+        // We're more than 100ms ahead of the first frame - just wait
+        return;
+      }
+      return;
+    }
+    
+    // Remove and close all frames before the best frame
+    const framesToRemove = buffer.splice(0, bestFrameIndex);
+    for (const frame of framesToRemove) {
+      frame.close();
+      droppedFramesRef.current++;
+    }
+    
+    // Display the best frame
+    const frameToDisplay = buffer.shift();
+    if (frameToDisplay) {
+      ctx.drawImage(frameToDisplay, 0, 0, canvas.width, canvas.height);
+      framesRenderedRef.current++;
+      frameToDisplay.close();
+      
+      updateState({ 
+        currentTime: bestFrameTime / 1_000_000,
+        buffering: false 
+      });
+    }
+    
+    // Update debug state periodically
+    const now = performance.now();
+    if (now - lastDebugUpdateRef.current > DEBUG_UPDATE_INTERVAL) {
+      lastDebugUpdateRef.current = now;
+      const videoDebug = videoDemuxerRef.current?.getDebugInfo();
+      const audioDebug = audioDemuxerRef.current?.getDebugInfo();
+      updateDebugState({
+        frameBufferSize: frameBufferRef.current.length,
+        audioBufferSize: audioBufferQueueRef.current.length,
+        chunksDecoded: chunksDecodedRef.current,
+        framesRendered: framesRenderedRef.current,
+        droppedFrames: droppedFramesRef.current,
+        videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
+        audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
+        videoIsEOF: videoDebug?.isEOF ?? false,
+        audioIsEOF: audioDebug?.isEOF ?? false,
+      });
+    }
+  }, [getCurrentMediaTime, updateState, updateDebugState]);
+
+  // Initialize player
   const initializePlayer = useCallback(async () => {
     try {
       isCleanedUpRef.current = false;
       updateState({ isLoading: true, error: null });
 
       if (!("VideoDecoder" in window)) {
-        throw new Error(
-          "WebCodecs API not supported. Tesla browser should support this feature."
-        );
+        throw new Error("WebCodecs API not supported. Tesla browser should support this feature.");
       }
 
       const canvas = canvasRef.current;
@@ -173,26 +388,20 @@ export function WebCodecsVideoPlayer({
         throw new Error("Canvas not available");
       }
 
-      // Optimize canvas for video playback:
-      // - alpha: false - no transparency needed, saves memory
-      // - desynchronized: true - reduces latency by not syncing with compositor
-      // - willReadFrequently: false - hints GPU acceleration for write-heavy operations
       const ctx = canvas.getContext("2d", { 
         alpha: false, 
         desynchronized: true,
-        willReadFrequently: false,
       });
       if (!ctx) {
         throw new Error("Failed to get canvas 2D context");
       }
-      // Cache the context to avoid retrieving it every frame in renderLoop
       canvasCtxRef.current = ctx;
 
+      // Initialize video demuxer and decoder
       videoDemuxerRef.current = new MP4Demuxer(videoUrl);
       await videoDemuxerRef.current.initialize(VIDEO_STREAM_TYPE);
 
-      const videoConfig =
-        videoDemuxerRef.current.getDecoderConfig() as VideoDecoderConfig;
+      const videoConfig = videoDemuxerRef.current.getDecoderConfig() as VideoDecoderConfig;
       const videoInfo = videoDemuxerRef.current.getVideoInfo();
 
       if (!videoInfo) {
@@ -206,9 +415,7 @@ export function WebCodecsVideoPlayer({
 
       videoDecoderRef.current = new VideoDecoder({
         output: (frame: VideoFrame) => {
-          // Enforce hard limit to prevent memory issues and crashes
-          if (frameBufferRef.current.length >= FRAME_BUFFER_MAX_SIZE) {
-            // Drop oldest frame to make room
+          if (frameBufferRef.current.length >= FRAME_BUFFER_MAX) {
             const oldFrame = frameBufferRef.current.shift();
             if (oldFrame) {
               oldFrame.close();
@@ -216,7 +423,6 @@ export function WebCodecsVideoPlayer({
             }
           }
           frameBufferRef.current.push(frame);
-          // Don't update debug state here - too frequent, causes re-renders
         },
         error: (e: Error) => {
           console.error("VideoDecoder error:", e);
@@ -241,19 +447,22 @@ export function WebCodecsVideoPlayer({
         codedWidth: videoConfig.codedWidth,
         codedHeight: videoConfig.codedHeight,
         description: videoConfig.description,
-        hardwareAcceleration: "prefer-hardware", // Use GPU acceleration when available
+        hardwareAcceleration: "prefer-hardware",
       });
       updateDebugState({ videoDecoderState: "configured" });
 
+      // Initialize audio demuxer and decoder
       try {
         audioDemuxerRef.current = new MP4Demuxer(videoUrl);
         await audioDemuxerRef.current.initialize(AUDIO_STREAM_TYPE);
 
-        const audioConfig =
-          audioDemuxerRef.current.getDecoderConfig() as AudioDecoderConfig;
+        const audioConfig = audioDemuxerRef.current.getDecoderConfig() as AudioDecoderConfig;
         const audioInfo = audioDemuxerRef.current.getAudioInfo();
 
         if (audioInfo) {
+          audioSampleRateRef.current = audioConfig.sampleRate;
+          audioChannelsRef.current = audioConfig.numberOfChannels;
+          
           audioContextRef.current = new AudioContext({
             sampleRate: audioConfig.sampleRate,
             latencyHint: "playback",
@@ -263,38 +472,13 @@ export function WebCodecsVideoPlayer({
           gainNodeRef.current.connect(audioContextRef.current.destination);
           gainNodeRef.current.gain.value = state.volume;
 
-          // Store audio config for later use
-          audioSampleRateRef.current = audioConfig.sampleRate;
-          audioChannelsRef.current = audioConfig.numberOfChannels;
-          
-          // Initialize sample arrays for each channel
-          audioDecodedSamplesRef.current = [];
-          for (let i = 0; i < audioConfig.numberOfChannels; i++) {
-            audioDecodedSamplesRef.current.push(new Float32Array(0));
-          }
-
           audioDecoderRef.current = new AudioDecoder({
             output: (audioData: AudioData) => {
-              // SINGLE BUFFER APPROACH: Accumulate ALL decoded samples into continuous arrays
-              // This will be combined into one AudioBuffer before playback
-              const numberOfFrames = audioData.numberOfFrames;
-              const numberOfChannels = audioData.numberOfChannels;
-              
-              for (let channel = 0; channel < numberOfChannels; channel++) {
-                const channelData = new Float32Array(numberOfFrames);
-                audioData.copyTo(channelData, {
-                  planeIndex: channel,
-                  format: "f32-planar",
-                });
-                
-                // Append to existing samples for this channel
-                const existingSamples = audioDecodedSamplesRef.current[channel];
-                const newSamples = new Float32Array(existingSamples.length + numberOfFrames);
-                newSamples.set(existingSamples);
-                newSamples.set(channelData, existingSamples.length);
-                audioDecodedSamplesRef.current[channel] = newSamples;
+              // Convert AudioData to AudioBuffer and add to queue
+              const buffer = audioDataToBuffer(audioData);
+              if (buffer) {
+                audioBufferQueueRef.current.push(buffer);
               }
-              
               audioData.close();
             },
             error: (e: Error) => {
@@ -332,7 +516,9 @@ export function WebCodecsVideoPlayer({
         duration: videoInfo.duration,
       });
 
-      await fillFrameBuffer();
+      // Pre-fill buffers
+      await fillVideoBuffer();
+      await fillAudioBuffer();
     } catch (err) {
       console.error("Player initialization error:", err);
       updateState({
@@ -340,468 +526,112 @@ export function WebCodecsVideoPlayer({
         error: err instanceof Error ? err.message : "Failed to initialize player",
       });
     }
-  }, [videoUrl, state.volume, updateState]);
+  }, [videoUrl, state.volume, updateState, updateDebugState, fillVideoBuffer, fillAudioBuffer, audioDataToBuffer]);
 
-  // Build the full audio buffer from accumulated decoded samples
-  const buildFullAudioBuffer = useCallback(() => {
-    if (!audioContextRef.current || audioDecodedSamplesRef.current.length === 0) {
-      return null;
-    }
-    
-    const numberOfChannels = audioChannelsRef.current;
-    const sampleRate = audioSampleRateRef.current;
-    const totalFrames = audioDecodedSamplesRef.current[0]?.length || 0;
-    
-    if (totalFrames === 0) {
-      return null;
-    }
-    
-    // Create ONE continuous AudioBuffer with ALL decoded audio
-    const fullBuffer = audioContextRef.current.createBuffer(
-      numberOfChannels,
-      totalFrames,
-      sampleRate
-    );
-    
-    // Copy all accumulated samples into the buffer
-    for (let channel = 0; channel < numberOfChannels; channel++) {
-      const channelData = audioDecodedSamplesRef.current[channel];
-      if (channelData) {
-        fullBuffer.copyToChannel(channelData, channel);
-      }
-    }
-    
-    return fullBuffer;
-  }, []);
-
-  // Start playing the full audio buffer from a specific offset
-  const startAudioPlayback = useCallback((offsetSeconds: number = 0) => {
-    if (!audioContextRef.current || !gainNodeRef.current || !fullAudioBufferRef.current) {
-      return;
-    }
-    
-    // Stop any existing audio source
-    if (audioSourceNodeRef.current) {
-      try {
-        audioSourceNodeRef.current.stop();
-        audioSourceNodeRef.current.disconnect();
-      } catch {
-        // Ignore errors if already stopped
-      }
-      audioSourceNodeRef.current = null;
-    }
-    
-    // Create a new source node for the full buffer
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = fullAudioBufferRef.current;
-    source.connect(gainNodeRef.current);
-    
-    // Start playback from the specified offset
-    // This plays the ENTIRE buffer as ONE continuous stream - no gaps!
-    const clampedOffset = Math.max(0, Math.min(offsetSeconds, fullAudioBufferRef.current.duration));
-    source.start(0, clampedOffset);
-    
-    audioSourceNodeRef.current = source;
-    audioStartTimeRef.current = audioContextRef.current.currentTime;
-    mediaTimeOffsetRef.current = clampedOffset;
-  }, []);
-
-  // Stop audio playback
-  const stopAudioPlayback = useCallback(() => {
-    if (audioSourceNodeRef.current) {
-      try {
-        audioSourceNodeRef.current.stop();
-        audioSourceNodeRef.current.disconnect();
-      } catch {
-        // Ignore errors if already stopped
-      }
-      audioSourceNodeRef.current = null;
-    }
-  }, []);
-
-  const fillFrameBuffer = useCallback(async () => {
-    if (fillInProgressRef.current) return;
-    if (isCleanedUpRef.current) return;
-    if (frameBufferRef.current.length >= FRAME_BUFFER_TARGET_SIZE) return;
-    if (!videoDemuxerRef.current || !videoDecoderRef.current) return;
-    if (videoDecoderRef.current.state === "closed") {
-      updateDebugState({ videoDecoderState: "closed" });
-      return;
-    }
-
-    fillInProgressRef.current = true;
-
-    try {
-      // PERFORMANCE: Limit decode queue size to prevent overwhelming the decoder
-      // This improves responsiveness and reduces memory pressure
-      while (
-        frameBufferRef.current.length < FRAME_BUFFER_TARGET_SIZE &&
-        videoDecoderRef.current &&
-        videoDecoderRef.current.state !== "closed" &&
-        videoDecoderRef.current.decodeQueueSize < MAX_VIDEO_DECODE_QUEUE_SIZE
-      ) {
-        const chunk = await videoDemuxerRef.current.getNextChunk();
-        if (!chunk) break;
-        if (isCleanedUpRef.current || videoDecoderRef.current.state === "closed") break;
-
-        const videoChunk = chunk as EncodedVideoChunk;
-        
-        // After configure() or flush(), we need to start with a keyframe
-        if (needsKeyframeRef.current) {
-          if (videoChunk.type !== "key") {
-            // Skip delta frames until we get a keyframe
-            continue;
-          }
-          needsKeyframeRef.current = false;
+  // Start playback intervals
+  const startPlaybackIntervals = useCallback(() => {
+    // Video rendering at fixed interval
+    if (!renderIntervalRef.current) {
+      renderIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current) {
+          renderFrame();
         }
-
-        videoDecoderRef.current.decode(videoChunk);
-        chunksDecodedRef.current++;
-      }
-
-      updateDebugState({ chunksDecoded: chunksDecodedRef.current });
-      
-      // Don't call flush() during normal playback - it causes the keyframe requirement issue
-      // flush() should only be called when seeking or stopping
-    } catch (err) {
-      console.error("Error filling frame buffer:", err);
-      updateDebugState({ lastError: `fillFrameBuffer: ${err instanceof Error ? err.message : String(err)}` });
+      }, RENDER_INTERVAL);
     }
-
-    fillInProgressRef.current = false;
-    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
-  }, [updateDebugState]);
-
-  // Pre-decode ALL audio chunks into the accumulated samples buffer
-  // This is called once before playback to build the full audio buffer
-  const preDecodeAllAudio = useCallback(async () => {
-    if (audioFillInProgressRef.current) return;
-    if (isCleanedUpRef.current) return;
-    if (!audioDemuxerRef.current || !audioDecoderRef.current) return;
-    if (audioDecoderRef.current.state === "closed") return;
-    if (audioReadyRef.current) return; // Already decoded
-
-    audioFillInProgressRef.current = true;
-
-    try {
-      // Decode ALL audio chunks - this builds the complete audio buffer
-      let totalChunks = 0;
-      const maxChunks = 10000; // Safety limit
-      
-      while (totalChunks < maxChunks) {
-        if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
-        if (isCleanedUpRef.current) break;
-        
-        // Wait for decoder queue to have space - prevents overwhelming the decoder
-        while (audioDecoderRef.current.decodeQueueSize > MAX_AUDIO_DECODE_QUEUE_SIZE) {
-          await new Promise(resolve => setTimeout(resolve, 10));
-          if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
-        }
-        
-        const chunk = await audioDemuxerRef.current.getNextChunk();
-        if (!chunk) {
-          // No more chunks - we've decoded everything
-          break;
-        }
-        
-        audioDecoderRef.current.decode(chunk as EncodedAudioChunk);
-        totalChunks++;
-      }
-      
-      // Flush the decoder to ensure all samples are output
-      if (audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
-        await audioDecoderRef.current.flush();
-      }
-      
-      // Build the full audio buffer from accumulated samples
-      fullAudioBufferRef.current = buildFullAudioBuffer();
-      audioReadyRef.current = true;
-      
-      console.log(`Audio pre-decode complete: ${totalChunks} chunks, ${audioDecodedSamplesRef.current[0]?.length || 0} samples`);
-    } catch (err) {
-      console.error("Error pre-decoding audio:", err);
-    }
-
-    audioFillInProgressRef.current = false;
-  }, [buildFullAudioBuffer]);
-
-  const chooseFrame = useCallback((targetTimestamp: number): VideoFrame | null => {
-    const buffer = frameBufferRef.current;
-    if (buffer.length === 0) return null;
-
-    // Binary search for the frame closest to targetTimestamp
-    // Frames are sorted by timestamp in ascending order
-    let left = 0;
-    let right = buffer.length - 1;
-    let bestIndex = 0;
-    let bestDelta = Math.abs(targetTimestamp - buffer[0].timestamp);
-
-    while (left <= right) {
-      const mid = (left + right) >>> 1; // Faster than Math.floor
-      const delta = Math.abs(targetTimestamp - buffer[mid].timestamp);
-      
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestIndex = mid;
-      }
-      
-      if (buffer[mid].timestamp < targetTimestamp) {
-        left = mid + 1;
-      } else if (buffer[mid].timestamp > targetTimestamp) {
-        right = mid - 1;
-      } else {
-        // Exact match
-        bestIndex = mid;
-        break;
-      }
-    }
-
-    // Close and remove all frames before the best frame
-    // Use splice() once instead of multiple shift() calls for better performance
-    if (bestIndex > 0) {
-      const staleFrames = buffer.splice(0, bestIndex);
-      for (const frame of staleFrames) {
-        frame.close();
-      }
-    }
-
-    return buffer[0] || null;
-  }, []);
-
-  const renderLoop = useCallback(() => {
-    if (!isPlayingRef.current) return;
-
-    const canvas = canvasRef.current;
-    const ctx = canvasCtxRef.current; // Use cached context instead of retrieving every frame
-    if (!canvas || !ctx) return;
-
-    // Get current time once at the start of the frame for consistency
-    const now = performance.now();
-
-    // Use AudioContext as master clock for A/V sync
-    // If no audio context, fall back to performance.now()
-    let currentMediaTime: number;
-    if (audioContextRef.current) {
-      const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
-      currentMediaTime = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000; // Convert to microseconds
-    } else {
-      const elapsedTime = now - playbackStartTimeRef.current;
-      currentMediaTime = mediaStartTimeRef.current + elapsedTime * 1000;
-    }
-
-    const buffer = frameBufferRef.current;
     
-    // For super smooth playback: display frames at their proper time
-    // Don't aggressively drop frames - only drop if WAY behind
-    // This prevents the "sped up" feeling from dropping too many frames
-    let dropCount = 0;
-    while (dropCount < buffer.length - 1) {
-      // Only drop frames that are VERY far behind (300ms+)
-      if (currentMediaTime - buffer[dropCount].timestamp > FRAME_DROP_THRESHOLD) {
-        dropCount++;
-      } else {
-        break;
-      }
-    }
-    if (dropCount > 0) {
-      const droppedFrames = buffer.splice(0, dropCount);
-      for (const frame of droppedFrames) {
-        frame.close();
-      }
-      droppedFramesRef.current += dropCount;
-    }
-
-    // Simple frame selection: display the first frame in buffer if its time has come
-    // This ensures smooth, consistent frame pacing
-    let frameToDisplay: VideoFrame | null = null;
-    if (buffer.length > 0) {
-      const firstFrame = buffer[0];
-      // Display this frame if we've reached or passed its timestamp
-      // Allow a small tolerance (16ms = ~1 frame at 60fps) for smoother display
-      if (currentMediaTime >= firstFrame.timestamp - 16000) {
-        frameToDisplay = firstFrame;
-      }
-    }
-
-    if (frameToDisplay) {
-      // Only render if this is a new frame (avoid re-rendering same frame)
-      if (frameToDisplay.timestamp !== lastRenderedTimestampRef.current) {
-        // PERFORMANCE: Use integer coordinates to avoid sub-pixel rendering overhead
-        // Sub-pixel rendering forces anti-aliasing calculations which are expensive
-        ctx.drawImage(frameToDisplay, 0, 0, canvas.width | 0, canvas.height | 0);
-        framesRenderedRef.current++;
-        lastRenderedTimestampRef.current = frameToDisplay.timestamp;
-        
-        // Remove the displayed frame from buffer and close it immediately
-        // This is critical for memory management - VideoFrames hold GPU resources
-        buffer.shift();
-        frameToDisplay.close();
-      }
-
-      const currentTimeSeconds = lastRenderedTimestampRef.current / 1_000_000;
-      
-      // Throttle state updates - only update currentTime every 100ms
-      if (now - lastDebugUpdateRef.current > 100) {
-        updateState({ currentTime: currentTimeSeconds, buffering: false });
-      }
-    } else if (buffer.length === 0) {
-      // Only show buffering if we have no frames at all
-      if (now - lastDebugUpdateRef.current > 100) {
-        updateState({ buffering: true });
-      }
-    }
-    // If we have frames but haven't reached their time yet, just wait (don't show buffering)
-
-    // Throttle debug panel updates to every DEBUG_UPDATE_INTERVAL ms
-    if (now - lastDebugUpdateRef.current > DEBUG_UPDATE_INTERVAL) {
-      lastDebugUpdateRef.current = now;
-      const videoDebug = videoDemuxerRef.current?.getDebugInfo();
-      const audioDebug = audioDemuxerRef.current?.getDebugInfo();
-      updateDebugState({
-        framesRendered: framesRenderedRef.current,
-        chunksDecoded: chunksDecodedRef.current,
-        droppedFrames: droppedFramesRef.current,
-        frameBufferSize: frameBufferRef.current.length,
-        videoSamplesReceived: videoDebug?.samplesReceived ?? 0,
-        audioSamplesReceived: audioDebug?.samplesReceived ?? 0,
-        videoTrackId: videoDebug?.trackId ?? null,
-        audioTrackId: audioDebug?.trackId ?? null,
-        videoIsEOF: videoDebug?.isEOF ?? false,
-        audioIsEOF: audioDebug?.isEOF ?? false,
-      });
-    }
-
-    // Don't call fillFrameBuffer/fillAudioBuffer here - use separate intervals
-    animationFrameRef.current = requestAnimationFrame(renderLoop);
-  }, [updateState, updateDebugState]);
-
-  // Start separate intervals for buffer filling (decoupled from render loop)
-  // SINGLE BUFFER AUDIO: No audio intervals needed - audio plays as one continuous buffer
-  const startBufferIntervals = useCallback(() => {
-    // Video buffer filling - more aggressive for smoother playback
-    if (!videoFillIntervalRef.current) {
-      videoFillIntervalRef.current = window.setInterval(() => {
-        if (isPlayingRef.current && !isCleanedUpRef.current) {
-          fillFrameBuffer();
+    // Buffer filling
+    if (!bufferFillIntervalRef.current) {
+      bufferFillIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current) {
+          fillVideoBuffer();
+          fillAudioBuffer();
         }
-      }, VIDEO_FILL_INTERVAL);
+      }, BUFFER_FILL_INTERVAL);
     }
-    // No audio intervals needed - audio is pre-decoded and plays as one continuous buffer
-  }, [fillFrameBuffer]);
+    
+    // Audio scheduling
+    if (!audioScheduleIntervalRef.current) {
+      audioScheduleIntervalRef.current = window.setInterval(() => {
+        if (isPlayingRef.current) {
+          scheduleAudioBuffers();
+        }
+      }, 50); // Schedule audio every 50ms
+    }
+  }, [renderFrame, fillVideoBuffer, fillAudioBuffer, scheduleAudioBuffers]);
 
-  // Stop all buffer filling intervals
-  const stopBufferIntervals = useCallback(() => {
-    if (videoFillIntervalRef.current) {
-      clearInterval(videoFillIntervalRef.current);
-      videoFillIntervalRef.current = null;
+  // Stop playback intervals
+  const stopPlaybackIntervals = useCallback(() => {
+    if (renderIntervalRef.current) {
+      clearInterval(renderIntervalRef.current);
+      renderIntervalRef.current = null;
     }
-    // No audio intervals to stop - audio is handled by single AudioBufferSourceNode
+    if (bufferFillIntervalRef.current) {
+      clearInterval(bufferFillIntervalRef.current);
+      bufferFillIntervalRef.current = null;
+    }
+    if (audioScheduleIntervalRef.current) {
+      clearInterval(audioScheduleIntervalRef.current);
+      audioScheduleIntervalRef.current = null;
+    }
   }, []);
 
+  // Play
   const play = useCallback(async () => {
     if (isPlayingRef.current) return;
 
-    // Show buffering state while we pre-fill buffers
     updateState({ isPlaying: true, buffering: true });
 
+    // Resume audio context if suspended
     if (audioContextRef.current?.state === "suspended") {
       await audioContextRef.current.resume();
     }
 
-    // SINGLE BUFFER AUDIO: Pre-decode ALL audio before playback starts
-    // This ensures seamless audio with no gaps
-    if (!audioReadyRef.current && audioDecoderRef.current) {
-      console.log("Pre-decoding all audio...");
-      await preDecodeAllAudio();
-      console.log("Audio pre-decode complete, buffer ready:", !!fullAudioBufferRef.current);
-    }
-
-    // Pre-fill video buffers before starting playback for smooth start
-    let bufferAttempts = 0;
-    const maxBufferAttempts = 50; // Max 5 seconds of buffering (50 * 100ms)
+    // Pre-fill buffers before starting
+    await fillVideoBuffer();
+    await fillAudioBuffer();
     
-    while (bufferAttempts < maxBufferAttempts) {
-      await fillFrameBuffer();
-      
-      const hasEnoughFrames = frameBufferRef.current.length >= MIN_FRAMES_BEFORE_PLAY;
-      
-      if (hasEnoughFrames) {
-        break;
-      }
-      
-      // Wait a bit before trying again
+    // Wait for some frames to be ready
+    let attempts = 0;
+    while (frameBufferRef.current.length < 10 && attempts < 50) {
+      await fillVideoBuffer();
       await new Promise(resolve => setTimeout(resolve, 100));
-      bufferAttempts++;
+      attempts++;
     }
 
-    // Now set isPlayingRef after buffers are ready
     isPlayingRef.current = true;
 
-    // Initialize A/V sync timing AFTER buffers are filled
-    // audioStartTimeRef = current audioContext time when playback starts
-    // mediaTimeOffsetRef = media timestamp (in seconds) that corresponds to audioStartTimeRef
-    const startOffset = mediaStartTimeRef.current / 1_000_000; // Convert microseconds to seconds
-    
+    // Initialize timing
     if (audioContextRef.current) {
-      audioStartTimeRef.current = audioContextRef.current.currentTime;
-      mediaTimeOffsetRef.current = startOffset;
-      
-      // If we have frames in the buffer, use the first frame's timestamp as the starting point
-      // This ensures proper sync when the media doesn't start at timestamp 0
-      if (frameBufferRef.current.length > 0) {
-        const firstFrameTimestamp = frameBufferRef.current[0].timestamp / 1_000_000;
-        // Only use first frame timestamp if we're starting from the beginning
-        if (mediaTimeOffsetRef.current === 0 || mediaTimeOffsetRef.current < firstFrameTimestamp) {
-          mediaTimeOffsetRef.current = firstFrameTimestamp;
-          mediaStartTimeRef.current = firstFrameTimestamp * 1_000_000;
-        }
-      }
+      playbackStartTimeRef.current = audioContextRef.current.currentTime;
+      nextAudioTimeRef.current = audioContextRef.current.currentTime;
     }
     
-    playbackStartTimeRef.current = performance.now();
-    
-    // SINGLE BUFFER AUDIO: Start playing the full audio buffer from the current position
-    // This plays the ENTIRE audio as ONE continuous stream - no gaps!
-    if (fullAudioBufferRef.current) {
-      startAudioPlayback(mediaTimeOffsetRef.current);
-    }
+    // Start audio scheduling
+    scheduleAudioBuffers();
 
-    // Start separate intervals for continuous video buffer filling
-    startBufferIntervals();
+    // Start playback intervals
+    startPlaybackIntervals();
 
-    // Clear buffering state and start render loop
     updateState({ buffering: false });
-    renderLoop();
-  }, [renderLoop, fillFrameBuffer, preDecodeAllAudio, startAudioPlayback, startBufferIntervals, updateState]);
+  }, [fillVideoBuffer, fillAudioBuffer, scheduleAudioBuffers, startPlaybackIntervals, updateState]);
 
+  // Pause
   const pause = useCallback(() => {
     isPlayingRef.current = false;
     updateState({ isPlaying: false });
 
-    // Stop buffer filling intervals
-    stopBufferIntervals();
+    stopPlaybackIntervals();
 
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-
-    // Save current media position based on audio context time (for A/V sync)
+    // Save current position
     if (audioContextRef.current) {
-      const audioElapsed = audioContextRef.current.currentTime - audioStartTimeRef.current;
-      mediaStartTimeRef.current = (mediaTimeOffsetRef.current + audioElapsed) * 1_000_000;
-    } else {
-      mediaStartTimeRef.current +=
-        (performance.now() - playbackStartTimeRef.current) * 1000;
+      const audioElapsed = audioContextRef.current.currentTime - playbackStartTimeRef.current;
+      mediaStartTimeRef.current += audioElapsed * 1_000_000;
     }
-
-    // SINGLE BUFFER AUDIO: Stop the audio source node
-    stopAudioPlayback();
 
     if (audioContextRef.current?.state === "running") {
       audioContextRef.current.suspend();
     }
-  }, [stopBufferIntervals, stopAudioPlayback, updateState]);
+  }, [stopPlaybackIntervals, updateState]);
 
   const togglePlayPause = useCallback(() => {
     if (state.isPlaying) {
@@ -820,50 +650,45 @@ export function WebCodecsVideoPlayer({
         pause();
       }
 
+      // Clear frame buffer
       for (const frame of frameBufferRef.current) {
         frame.close();
       }
       frameBufferRef.current = [];
+      
+      // Clear audio buffers
+      audioBufferQueueRef.current = [];
 
-      // SINGLE BUFFER AUDIO: No need to clear audio buffer queue
-      // The full audio buffer is already decoded and ready
-
+      // Reset timing
       mediaStartTimeRef.current = newTime * 1_000_000;
-      updateState({ currentTime: newTime });
-
-      // After seeking, we need to start with a keyframe
       needsKeyframeRef.current = true;
 
-      // Only seek video demuxer - audio is already fully decoded
+      // Seek demuxers
       videoDemuxerRef.current?.seek(newTime);
+      audioDemuxerRef.current?.seek(newTime);
 
-      fillFrameBuffer().then(() => {
-        if (wasPlaying) {
-          play();
-        }
-      });
+      updateState({ currentTime: newTime });
+
+      if (wasPlaying) {
+        play();
+      }
     },
-    [pause, play, fillFrameBuffer, updateState]
+    [pause, play, updateState]
   );
 
   const handleVolumeChange = useCallback(
     (value: number[]) => {
       const newVolume = value[0];
-      updateState({ volume: newVolume });
+      updateState({ volume: newVolume, isMuted: newVolume === 0 });
 
       if (gainNodeRef.current) {
-        gainNodeRef.current.gain.setTargetAtTime(
+        gainNodeRef.current.gain.setValueAtTime(
           newVolume,
-          audioContextRef.current?.currentTime || 0,
-          0.1
+          audioContextRef.current?.currentTime || 0
         );
       }
-
-      if (newVolume > 0 && state.isMuted) {
-        updateState({ isMuted: false });
-      }
     },
-    [state.isMuted, updateState]
+    [updateState]
   );
 
   const toggleMute = useCallback(() => {
@@ -871,212 +696,160 @@ export function WebCodecsVideoPlayer({
     updateState({ isMuted: newMuted });
 
     if (gainNodeRef.current) {
-      gainNodeRef.current.gain.setTargetAtTime(
+      gainNodeRef.current.gain.setValueAtTime(
         newMuted ? 0 : state.volume,
-        audioContextRef.current?.currentTime || 0,
-        0.1
+        audioContextRef.current?.currentTime || 0
       );
     }
   }, [state.isMuted, state.volume, updateState]);
 
   const toggleFullscreen = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    if (!document.fullscreenElement) {
-      canvas.requestFullscreen().catch(console.error);
-    } else {
-      document.exitFullscreen();
+    const container = canvasRef.current?.parentElement?.parentElement;
+    if (container) {
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else {
+        container.requestFullscreen();
+      }
     }
   }, []);
 
   const skipForward = useCallback(() => {
-    const newTime = Math.min(state.currentTime + 10, state.duration);
-    handleSeek([newTime]);
+    handleSeek([Math.min(state.currentTime + 10, state.duration)]);
   }, [state.currentTime, state.duration, handleSeek]);
 
   const skipBackward = useCallback(() => {
-    const newTime = Math.max(state.currentTime - 10, 0);
-    handleSeek([newTime]);
+    handleSeek([Math.max(state.currentTime - 10, 0)]);
   }, [state.currentTime, handleSeek]);
 
-  const formatTime = (seconds: number): string => {
+  const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
+  // Cleanup
+  const cleanup = useCallback(() => {
+    isCleanedUpRef.current = true;
+    isPlayingRef.current = false;
+
+    stopPlaybackIntervals();
+
+    // Close video frames
+    for (const frame of frameBufferRef.current) {
+      try {
+        frame.close();
+      } catch {}
+    }
+    frameBufferRef.current = [];
+
+    // Clear audio buffers
+    audioBufferQueueRef.current = [];
+
+    // Close decoders
+    if (videoDecoderRef.current?.state !== "closed") {
+      try {
+        videoDecoderRef.current?.close();
+      } catch {}
+    }
+    if (audioDecoderRef.current?.state !== "closed") {
+      try {
+        audioDecoderRef.current?.close();
+      } catch {}
+    }
+
+    // Close audio context
+    if (audioContextRef.current?.state !== "closed") {
+      try {
+        audioContextRef.current?.close();
+      } catch {}
+    }
+
+    videoDecoderRef.current = null;
+    audioDecoderRef.current = null;
+    audioContextRef.current = null;
+    gainNodeRef.current = null;
+    videoDemuxerRef.current = null;
+    audioDemuxerRef.current = null;
+  }, [stopPlaybackIntervals]);
+
+  // Initialize on mount
   useEffect(() => {
     initializePlayer();
+    return cleanup;
+  }, []);
 
-    return () => {
-      if (isCleanedUpRef.current) return;
-      isCleanedUpRef.current = true;
-      isPlayingRef.current = false;
-
-      // Clear buffer filling intervals
-      if (videoFillIntervalRef.current) {
-        clearInterval(videoFillIntervalRef.current);
-        videoFillIntervalRef.current = null;
-      }
-      if (audioFillIntervalRef.current) {
-        clearInterval(audioFillIntervalRef.current);
-        audioFillIntervalRef.current = null;
-      }
-      if (audioScheduleIntervalRef.current) {
-        clearInterval(audioScheduleIntervalRef.current);
-        audioScheduleIntervalRef.current = null;
-      }
-
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-
-      for (const frame of frameBufferRef.current) {
-        try {
-          frame.close();
-        } catch (e) {
-          // Frame may already be closed
-        }
-      }
-      frameBufferRef.current = [];
-
-      for (const audioData of audioBufferQueueRef.current) {
-        try {
-          audioData.close();
-        } catch (e) {
-          // AudioData may already be closed
-        }
-      }
-      audioBufferQueueRef.current = [];
-
-      if (videoDecoderRef.current && videoDecoderRef.current.state !== "closed") {
-        try {
-          videoDecoderRef.current.close();
-        } catch (e) {
-          console.warn("Error closing video decoder:", e);
-        }
-      }
-      videoDecoderRef.current = null;
-
-      if (audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
-        try {
-          audioDecoderRef.current.close();
-        } catch (e) {
-          console.warn("Error closing audio decoder:", e);
-        }
-      }
-      audioDecoderRef.current = null;
-
-      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-        try {
-          audioContextRef.current.close();
-        } catch (e) {
-          console.warn("Error closing audio context:", e);
-        }
-      }
-      audioContextRef.current = null;
-
-      videoDemuxerRef.current?.stop();
-      audioDemuxerRef.current?.stop();
-      videoDemuxerRef.current = null;
-      audioDemuxerRef.current = null;
-    };
-  }, [initializePlayer]);
-
-  if (state.error) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-black text-white p-8">
-        <div className="text-center max-w-md">
-          <h2 className="text-2xl font-bold mb-4">Playback Error</h2>
-          <p className="text-gray-400 mb-6">{state.error}</p>
-          <Button onClick={onClose} variant="outline">
-            Back to Library
-          </Button>
-        </div>
-      </div>
-    );
-  }
+  // Handle video URL changes
+  useEffect(() => {
+    cleanup();
+    // Reset state
+    chunksDecodedRef.current = 0;
+    framesRenderedRef.current = 0;
+    droppedFramesRef.current = 0;
+    mediaStartTimeRef.current = 0;
+    needsKeyframeRef.current = true;
+    initializePlayer();
+  }, [videoUrl]);
 
   return (
-    <div className="relative w-full h-screen bg-black flex flex-col">
-      <div className="flex-1 flex items-center justify-center relative">
+    <div className="relative w-full h-full bg-black flex flex-col">
+      {/* Video Canvas */}
+      <div className="flex-1 relative flex items-center justify-center overflow-hidden">
         <canvas
           ref={canvasRef}
           className="max-w-full max-h-full object-contain"
-          style={{ touchAction: "none" }}
+          onClick={togglePlayPause}
         />
 
-        {state.isLoading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/80">
-            <div className="text-center">
-              <Loader2 className="w-12 h-12 animate-spin text-white mx-auto mb-4" />
-              <p className="text-white">Initializing WebCodecs player...</p>
-            </div>
-          </div>
-        )}
-
-        {state.buffering && !state.isLoading && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+        {/* Loading Overlay */}
+        {(state.isLoading || state.buffering) && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/50">
             <Loader2 className="w-12 h-12 animate-spin text-white" />
           </div>
         )}
 
-        {!state.isPlaying && !state.isLoading && (
-          <button
-            onClick={togglePlayPause}
-            className="absolute inset-0 flex items-center justify-center group"
-          >
-            <div className="w-20 h-20 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center group-hover:bg-white/30 transition-colors">
-              <Play className="w-10 h-10 text-white ml-1" />
-            </div>
-          </button>
-        )}
-
-        {showDebug && (
-          <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-3 rounded-lg font-mono max-w-sm">
-            <div className="font-bold mb-2 text-yellow-400">Debug Panel</div>
-            <div className="space-y-1">
-              <div>Video Decoder: <span className={debugState.videoDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.videoDecoderState}</span></div>
-              <div>Audio Decoder: <span className={debugState.audioDecoderState === "configured" ? "text-green-400" : "text-red-400"}>{debugState.audioDecoderState}</span></div>
-              <div>Demuxer Ready: <span className={debugState.demuxerReady ? "text-green-400" : "text-red-400"}>{debugState.demuxerReady ? "Yes" : "No"}</span></div>
-              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Video Demuxer:</div>
-              <div>Track ID: <span className="text-blue-400">{debugState.videoTrackId ?? "null"}</span></div>
-              <div>Samples Received: <span className={debugState.videoSamplesReceived > 0 ? "text-green-400" : "text-red-400"}>{debugState.videoSamplesReceived}</span></div>
-              <div>EOF: <span className={debugState.videoIsEOF ? "text-yellow-400" : "text-gray-400"}>{debugState.videoIsEOF ? "Yes" : "No"}</span></div>
-              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Audio Demuxer:</div>
-              <div>Track ID: <span className="text-blue-400">{debugState.audioTrackId ?? "null"}</span></div>
-              <div>Samples Received: <span className={debugState.audioSamplesReceived > 0 ? "text-green-400" : "text-red-400"}>{debugState.audioSamplesReceived}</span></div>
-              <div>EOF: <span className={debugState.audioIsEOF ? "text-yellow-400" : "text-gray-400"}>{debugState.audioIsEOF ? "Yes" : "No"}</span></div>
-              <div className="border-t border-gray-600 my-1 pt-1 font-bold text-cyan-400">Playback:</div>
-              <div>Frame Buffer: <span className={debugState.frameBufferSize > 0 ? "text-green-400" : "text-yellow-400"}>{debugState.frameBufferSize}</span></div>
-              <div>Chunks Decoded: <span className="text-blue-400">{debugState.chunksDecoded}</span></div>
-              <div>Frames Rendered: <span className="text-blue-400">{debugState.framesRendered}</span></div>
-              <div>Dropped Frames: <span className={debugState.droppedFrames > 0 ? "text-red-400" : "text-green-400"}>{debugState.droppedFrames}</span></div>
-              <div>Buffering: <span className={state.buffering ? "text-yellow-400" : "text-green-400"}>{state.buffering ? "Yes" : "No"}</span></div>
-              <div>Playing: <span className={state.isPlaying ? "text-green-400" : "text-gray-400"}>{state.isPlaying ? "Yes" : "No"}</span></div>
-              {debugState.lastError && (
-                <div className="text-red-400 mt-2 break-words">Error: {debugState.lastError}</div>
-              )}
+        {/* Error Overlay */}
+        {state.error && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/75">
+            <div className="text-center text-white p-4">
+              <p className="text-red-500 mb-2">Error</p>
+              <p className="text-sm">{state.error}</p>
             </div>
           </div>
         )}
 
-        <button
-          onClick={() => setShowDebug(!showDebug)}
-          className="absolute top-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded hover:bg-black/80"
-        >
-          {showDebug ? "Hide Debug" : "Show Debug"}
-        </button>
+        {/* Debug Panel */}
+        {showDebug && (
+          <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-2 rounded font-mono max-w-xs">
+            <div className="font-bold mb-1">Debug Panel (Streaming Audio)</div>
+            <div>Video Decoder: {debugState.videoDecoderState}</div>
+            <div>Audio Decoder: {debugState.audioDecoderState}</div>
+            <div>Demuxer Ready: {debugState.demuxerReady ? "Yes" : "No"}</div>
+            <div className="mt-1 font-bold">Buffers:</div>
+            <div>Frame Buffer: {debugState.frameBufferSize}</div>
+            <div>Audio Buffer: {debugState.audioBufferSize}</div>
+            <div className="mt-1 font-bold">Stats:</div>
+            <div>Chunks Decoded: {debugState.chunksDecoded}</div>
+            <div>Frames Rendered: {debugState.framesRendered}</div>
+            <div className={debugState.droppedFrames > 10 ? "text-red-400" : ""}>
+              Dropped Frames: {debugState.droppedFrames}
+            </div>
+            <div className="mt-1 font-bold">Playback:</div>
+            <div>Buffering: {state.buffering ? "Yes" : "No"}</div>
+            <div>Playing: {state.isPlaying ? "Yes" : "No"}</div>
+            {debugState.lastError && (
+              <div className="mt-1 text-red-400 break-words">
+                Error: {debugState.lastError}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
-      <div className="bg-gradient-to-t from-black via-black/90 to-transparent p-6 space-y-4">
-        {title && (
-          <h3 className="text-white font-semibold text-lg truncate">{title}</h3>
-        )}
-
-        <div className="space-y-2">
+      {/* Controls */}
+      <div className="bg-gradient-to-t from-black/90 to-transparent p-4">
+        {/* Progress Bar */}
+        <div className="mb-4">
           <Slider
             value={[state.currentTime]}
             max={state.duration || 100}
@@ -1084,28 +857,30 @@ export function WebCodecsVideoPlayer({
             onValueChange={handleSeek}
             className="cursor-pointer"
           />
-          <div className="flex justify-between text-sm text-gray-400">
+          <div className="flex justify-between text-xs text-gray-400 mt-1">
             <span>{formatTime(state.currentTime)}</span>
             <span>{formatTime(state.duration)}</span>
           </div>
         </div>
 
+        {/* Control Buttons */}
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
             <Button
-              onClick={skipBackward}
-              size="icon"
               variant="ghost"
-              className="text-white hover:bg-white/10"
+              size="icon"
+              onClick={skipBackward}
+              className="text-white hover:bg-white/20"
             >
               <SkipBack className="w-5 h-5" />
             </Button>
 
             <Button
-              onClick={togglePlayPause}
-              size="lg"
               variant="ghost"
-              className="text-white hover:bg-white/10"
+              size="icon"
+              onClick={togglePlayPause}
+              className="text-white hover:bg-white/20"
+              disabled={state.isLoading}
             >
               {state.isPlaying ? (
                 <Pause className="w-6 h-6" />
@@ -1115,22 +890,22 @@ export function WebCodecsVideoPlayer({
             </Button>
 
             <Button
-              onClick={skipForward}
-              size="icon"
               variant="ghost"
-              className="text-white hover:bg-white/10"
+              size="icon"
+              onClick={skipForward}
+              className="text-white hover:bg-white/20"
             >
               <SkipForward className="w-5 h-5" />
             </Button>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 ml-4">
               <Button
-                onClick={toggleMute}
-                size="icon"
                 variant="ghost"
-                className="text-white hover:bg-white/10"
+                size="icon"
+                onClick={toggleMute}
+                className="text-white hover:bg-white/20"
               >
-                {state.isMuted || state.volume === 0 ? (
+                {state.isMuted ? (
                   <VolumeX className="w-5 h-5" />
                 ) : (
                   <Volume2 className="w-5 h-5" />
@@ -1141,32 +916,47 @@ export function WebCodecsVideoPlayer({
                 max={1}
                 step={0.01}
                 onValueChange={handleVolumeChange}
-                className="w-24 cursor-pointer"
+                className="w-24"
               />
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            {onClose && (
-              <Button
-                onClick={onClose}
-                variant="ghost"
-                className="text-white hover:bg-white/10"
-              >
-                Back
-              </Button>
-            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowDebug(!showDebug)}
+              className="text-white hover:bg-white/20 text-xs"
+            >
+              {showDebug ? "Hide Debug" : "Show Debug"}
+            </Button>
 
             <Button
-              onClick={toggleFullscreen}
-              size="icon"
               variant="ghost"
-              className="text-white hover:bg-white/10"
+              size="icon"
+              onClick={toggleFullscreen}
+              className="text-white hover:bg-white/20"
             >
               <Maximize className="w-5 h-5" />
             </Button>
+
+            {onClose && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onClose}
+                className="text-white hover:bg-white/20"
+              >
+                Close
+              </Button>
+            )}
           </div>
         </div>
+
+        {/* Title */}
+        {title && (
+          <div className="mt-2 text-white text-sm truncate">{title}</div>
+        )}
       </div>
     </div>
   );
