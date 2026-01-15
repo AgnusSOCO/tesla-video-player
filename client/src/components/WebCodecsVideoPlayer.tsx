@@ -317,35 +317,21 @@ export function WebCodecsVideoPlayer({
       return;
     }
 
-    // Schedule audio buffers using their ACTUAL timestamps from the demuxer
-    // This is critical for proper A/V sync - we must respect the original timestamps
     const currentAudioContextTime = audioContextRef.current.currentTime;
     
-    // Process audio chunks one at a time to respect their timestamps
+    // Simple sequential audio scheduling for smooth playback
+    // Schedule audio chunks one after another, keeping track of when the next one should play
+    // This is more reliable than timestamp-based scheduling which can skip chunks
+    
     while (audioBufferQueueRef.current.length > 0) {
-      const audioData = audioBufferQueueRef.current[0];
-      
-      // Calculate when this audio chunk should play based on its timestamp
-      // audioData.timestamp is in microseconds, convert to seconds
-      const audioTimestampSeconds = audioData.timestamp / 1_000_000;
-      
-      // Calculate the playback time for this chunk:
-      // playbackTime = audioContextTime when playback started + (chunk timestamp - media start time)
-      const scheduledTime = audioStartTimeRef.current + (audioTimestampSeconds - mediaTimeOffsetRef.current);
-      
-      // Don't schedule audio that's too far in the future
-      if (scheduledTime > currentAudioContextTime + AUDIO_SCHEDULE_AHEAD) {
+      // Don't schedule too far ahead
+      const audioAhead = nextAudioTimeRef.current - currentAudioContextTime;
+      if (audioAhead > AUDIO_SCHEDULE_AHEAD) {
         break;
       }
       
-      // Remove from queue
-      audioBufferQueueRef.current.shift();
-      
-      // Skip audio that's already in the past (we're behind)
-      if (scheduledTime < currentAudioContextTime - 0.1) {
-        audioData.close();
-        continue;
-      }
+      const audioData = audioBufferQueueRef.current.shift();
+      if (!audioData) break;
 
       const numberOfFrames = audioData.numberOfFrames;
       const numberOfChannels = audioData.numberOfChannels;
@@ -370,9 +356,13 @@ export function WebCodecsVideoPlayer({
       source.buffer = audioBuffer;
       source.connect(gainNodeRef.current);
 
-      // Schedule at the correct time based on the chunk's timestamp
-      const startTime = Math.max(scheduledTime, currentAudioContextTime);
+      // Schedule sequentially: each chunk plays right after the previous one
+      // If we're behind, start immediately
+      const startTime = Math.max(nextAudioTimeRef.current, currentAudioContextTime);
       source.start(startTime);
+      
+      // Update next audio time for the following chunk
+      nextAudioTimeRef.current = startTime + audioBuffer.duration;
 
       audioData.close();
     }
@@ -699,6 +689,9 @@ export function WebCodecsVideoPlayer({
     // mediaTimeOffsetRef = media timestamp (in seconds) that corresponds to audioStartTimeRef
     if (audioContextRef.current) {
       audioStartTimeRef.current = audioContextRef.current.currentTime;
+      // Initialize nextAudioTimeRef to current time - audio will start playing immediately
+      nextAudioTimeRef.current = audioContextRef.current.currentTime;
+      
       // mediaStartTimeRef is in microseconds, convert to seconds for mediaTimeOffsetRef
       // This represents the media position we're starting from
       mediaTimeOffsetRef.current = mediaStartTimeRef.current / 1_000_000;
@@ -717,7 +710,7 @@ export function WebCodecsVideoPlayer({
     
     playbackStartTimeRef.current = performance.now();
     
-    // Schedule initial audio
+    // Schedule initial audio - this will start playing audio immediately
     scheduleAudioPlayback();
 
     // Start separate intervals for continuous buffer filling
