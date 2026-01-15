@@ -57,15 +57,14 @@ interface DebugState {
 // Performance tuning constants - optimized for super smooth playback
 const FRAME_BUFFER_TARGET_SIZE = 60; // 2 seconds at 30fps - large buffer for smooth playback
 const FRAME_BUFFER_MAX_SIZE = 120; // Hard limit to prevent memory issues (4s at 30fps)
-const AUDIO_BUFFER_TARGET_SIZE = 50; // Target audio buffer size
-const AUDIO_SCHEDULE_AHEAD = 2.0; // Schedule 2 seconds of audio ahead for gap-free playback
 const DEBUG_UPDATE_INTERVAL = 500; // Update debug panel every 500ms instead of every frame
 const FRAME_DROP_THRESHOLD = 300000; // Drop frames more than 300ms behind (in microseconds) - very lenient
 const VIDEO_FILL_INTERVAL = 50; // Fill video buffer every 50ms
-const AUDIO_FILL_INTERVAL = 50; // Fill audio buffer every 50ms
-const AUDIO_SCHEDULE_INTERVAL = 30; // Schedule audio every 30ms
 const MIN_FRAMES_BEFORE_PLAY = 20; // Wait for at least 20 frames before starting playback
-const MIN_AUDIO_BEFORE_PLAY = 10; // Wait for at least 10 audio chunks before starting playback
+
+// SINGLE BUFFER AUDIO APPROACH: Pre-decode ALL audio into one continuous buffer
+// This eliminates gaps caused by scheduling multiple AudioBufferSourceNodes
+const AUDIO_PREDECODE_CHUNKS = 500; // Pre-decode up to 500 chunks before playback (~10+ seconds)
 
 export function WebCodecsVideoPlayer({
   videoUrl,
@@ -125,14 +124,20 @@ export function WebCodecsVideoPlayer({
   const isPlayingRef = useRef<boolean>(false);
   const fillInProgressRef = useRef<boolean>(false);
   const audioFillInProgressRef = useRef<boolean>(false);
-  const nextAudioTimeRef = useRef<number>(0);
   const isCleanedUpRef = useRef<boolean>(false);
   const needsKeyframeRef = useRef<boolean>(true); // After configure() or flush(), we need a keyframe
   
   // Separate intervals for buffer filling (don't tie to render loop)
   const videoFillIntervalRef = useRef<number | null>(null);
-  const audioFillIntervalRef = useRef<number | null>(null);
-  const audioScheduleIntervalRef = useRef<number | null>(null);
+  
+  // SINGLE BUFFER AUDIO: Store the entire decoded audio as one continuous buffer
+  // This eliminates gaps caused by scheduling multiple AudioBufferSourceNodes
+  const fullAudioBufferRef = useRef<AudioBuffer | null>(null);
+  const audioSourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const audioDecodedSamplesRef = useRef<Float32Array[]>([]); // Accumulate decoded samples per channel
+  const audioSampleRateRef = useRef<number>(44100);
+  const audioChannelsRef = useRef<number>(2);
+  const audioReadyRef = useRef<boolean>(false);
   
   // A/V sync: Use audioContext.currentTime as master clock
   // audioStartTimeRef = audioContext.currentTime when playback started
@@ -252,16 +257,39 @@ export function WebCodecsVideoPlayer({
           gainNodeRef.current.connect(audioContextRef.current.destination);
           gainNodeRef.current.gain.value = state.volume;
 
+          // Store audio config for later use
+          audioSampleRateRef.current = audioConfig.sampleRate;
+          audioChannelsRef.current = audioConfig.numberOfChannels;
+          
+          // Initialize sample arrays for each channel
+          audioDecodedSamplesRef.current = [];
+          for (let i = 0; i < audioConfig.numberOfChannels; i++) {
+            audioDecodedSamplesRef.current.push(new Float32Array(0));
+          }
+
           audioDecoderRef.current = new AudioDecoder({
             output: (audioData: AudioData) => {
-              // Limit audio buffer to prevent memory issues (max 100 chunks)
-              const MAX_AUDIO_BUFFER = 100;
-              if (audioBufferQueueRef.current.length >= MAX_AUDIO_BUFFER) {
-                const oldData = audioBufferQueueRef.current.shift();
-                if (oldData) oldData.close();
+              // SINGLE BUFFER APPROACH: Accumulate ALL decoded samples into continuous arrays
+              // This will be combined into one AudioBuffer before playback
+              const numberOfFrames = audioData.numberOfFrames;
+              const numberOfChannels = audioData.numberOfChannels;
+              
+              for (let channel = 0; channel < numberOfChannels; channel++) {
+                const channelData = new Float32Array(numberOfFrames);
+                audioData.copyTo(channelData, {
+                  planeIndex: channel,
+                  format: "f32-planar",
+                });
+                
+                // Append to existing samples for this channel
+                const existingSamples = audioDecodedSamplesRef.current[channel];
+                const newSamples = new Float32Array(existingSamples.length + numberOfFrames);
+                newSamples.set(existingSamples);
+                newSamples.set(channelData, existingSamples.length);
+                audioDecodedSamplesRef.current[channel] = newSamples;
               }
-              audioBufferQueueRef.current.push(audioData);
-              // Don't call scheduleAudioPlayback here - use interval instead
+              
+              audioData.close();
             },
             error: (e: Error) => {
               console.error("AudioDecoder error:", e);
@@ -308,79 +336,81 @@ export function WebCodecsVideoPlayer({
     }
   }, [videoUrl, state.volume, updateState]);
 
-  const scheduleAudioPlayback = useCallback(() => {
-    if (
-      !audioContextRef.current ||
-      !gainNodeRef.current ||
-      !isPlayingRef.current
-    ) {
-      return;
-    }
-
-    const currentAudioContextTime = audioContextRef.current.currentTime;
-    
-    // Don't schedule too far ahead
-    const audioAhead = nextAudioTimeRef.current - currentAudioContextTime;
-    if (audioAhead > AUDIO_SCHEDULE_AHEAD) {
-      return;
+  // Build the full audio buffer from accumulated decoded samples
+  const buildFullAudioBuffer = useCallback(() => {
+    if (!audioContextRef.current || audioDecodedSamplesRef.current.length === 0) {
+      return null;
     }
     
-    // BATCH multiple audio chunks into larger buffers for seamless playback
-    // Creating many small AudioBufferSourceNodes causes gaps between chunks
-    // By combining chunks into larger buffers, we eliminate these gaps
-    const BATCH_SIZE = 20; // Combine up to 20 chunks (~0.5s of audio at typical chunk sizes)
-    const chunksToProcess: AudioData[] = [];
+    const numberOfChannels = audioChannelsRef.current;
+    const sampleRate = audioSampleRateRef.current;
+    const totalFrames = audioDecodedSamplesRef.current[0]?.length || 0;
     
-    while (chunksToProcess.length < BATCH_SIZE && audioBufferQueueRef.current.length > 0) {
-      const chunk = audioBufferQueueRef.current.shift();
-      if (chunk) chunksToProcess.push(chunk);
+    if (totalFrames === 0) {
+      return null;
     }
     
-    if (chunksToProcess.length === 0) return;
-    
-    // Calculate total frames needed for the combined buffer
-    let totalFrames = 0;
-    const sampleRate = chunksToProcess[0].sampleRate;
-    const numberOfChannels = chunksToProcess[0].numberOfChannels;
-    
-    for (const chunk of chunksToProcess) {
-      totalFrames += chunk.numberOfFrames;
-    }
-    
-    // Create a single larger buffer for all chunks - this eliminates gaps
-    const combinedBuffer = audioContextRef.current.createBuffer(
+    // Create ONE continuous AudioBuffer with ALL decoded audio
+    const fullBuffer = audioContextRef.current.createBuffer(
       numberOfChannels,
       totalFrames,
       sampleRate
     );
     
-    // Copy all chunks into the combined buffer sequentially
-    let frameOffset = 0;
-    for (const audioData of chunksToProcess) {
-      for (let channel = 0; channel < numberOfChannels; channel++) {
-        const channelData = new Float32Array(audioData.numberOfFrames);
-        audioData.copyTo(channelData, {
-          planeIndex: channel,
-          format: "f32-planar",
-        });
-        // Copy to the correct offset in the combined buffer
-        combinedBuffer.getChannelData(channel).set(channelData, frameOffset);
+    // Copy all accumulated samples into the buffer
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+      const channelData = audioDecodedSamplesRef.current[channel];
+      if (channelData) {
+        fullBuffer.copyToChannel(channelData, channel);
       }
-      frameOffset += audioData.numberOfFrames;
-      audioData.close();
     }
     
-    // Create and schedule the combined audio source
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = combinedBuffer;
-    source.connect(gainNodeRef.current);
+    return fullBuffer;
+  }, []);
 
-    // Schedule sequentially: this buffer plays right after the previous one
-    const startTime = Math.max(nextAudioTimeRef.current, currentAudioContextTime);
-    source.start(startTime);
+  // Start playing the full audio buffer from a specific offset
+  const startAudioPlayback = useCallback((offsetSeconds: number = 0) => {
+    if (!audioContextRef.current || !gainNodeRef.current || !fullAudioBufferRef.current) {
+      return;
+    }
     
-    // Update next audio time for the following batch
-    nextAudioTimeRef.current = startTime + combinedBuffer.duration;
+    // Stop any existing audio source
+    if (audioSourceNodeRef.current) {
+      try {
+        audioSourceNodeRef.current.stop();
+        audioSourceNodeRef.current.disconnect();
+      } catch {
+        // Ignore errors if already stopped
+      }
+      audioSourceNodeRef.current = null;
+    }
+    
+    // Create a new source node for the full buffer
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = fullAudioBufferRef.current;
+    source.connect(gainNodeRef.current);
+    
+    // Start playback from the specified offset
+    // This plays the ENTIRE buffer as ONE continuous stream - no gaps!
+    const clampedOffset = Math.max(0, Math.min(offsetSeconds, fullAudioBufferRef.current.duration));
+    source.start(0, clampedOffset);
+    
+    audioSourceNodeRef.current = source;
+    audioStartTimeRef.current = audioContextRef.current.currentTime;
+    mediaTimeOffsetRef.current = clampedOffset;
+  }, []);
+
+  // Stop audio playback
+  const stopAudioPlayback = useCallback(() => {
+    if (audioSourceNodeRef.current) {
+      try {
+        audioSourceNodeRef.current.stop();
+        audioSourceNodeRef.current.disconnect();
+      } catch {
+        // Ignore errors if already stopped
+      }
+      audioSourceNodeRef.current = null;
+    }
   }, []);
 
   const fillFrameBuffer = useCallback(async () => {
@@ -434,43 +464,58 @@ export function WebCodecsVideoPlayer({
     // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
   }, [updateDebugState]);
 
-  const fillAudioBuffer = useCallback(async () => {
+  // Pre-decode ALL audio chunks into the accumulated samples buffer
+  // This is called once before playback to build the full audio buffer
+  const preDecodeAllAudio = useCallback(async () => {
     if (audioFillInProgressRef.current) return;
     if (isCleanedUpRef.current) return;
     if (!audioDemuxerRef.current || !audioDecoderRef.current) return;
     if (audioDecoderRef.current.state === "closed") return;
+    if (audioReadyRef.current) return; // Already decoded
 
     audioFillInProgressRef.current = true;
 
     try {
-      // Increased batch size and queue limit for smoother audio
-      // Decode more chunks at once to keep buffer full
-      const targetChunks = 50;
-      let decodedChunks = 0;
-
-      while (
-        decodedChunks < targetChunks &&
-        audioDecoderRef.current &&
-        audioDecoderRef.current.state !== "closed" &&
-        audioDecoderRef.current.decodeQueueSize < 30
-      ) {
+      // Decode ALL audio chunks - this builds the complete audio buffer
+      let totalChunks = 0;
+      const maxChunks = 10000; // Safety limit
+      
+      while (totalChunks < maxChunks) {
+        if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
+        if (isCleanedUpRef.current) break;
+        
+        // Wait for decoder queue to have space
+        while (audioDecoderRef.current.decodeQueueSize > 50) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          if (!audioDecoderRef.current || audioDecoderRef.current.state === "closed") break;
+        }
+        
         const chunk = await audioDemuxerRef.current.getNextChunk();
-        if (!chunk) break;
-        if (isCleanedUpRef.current || audioDecoderRef.current.state === "closed") break;
-
+        if (!chunk) {
+          // No more chunks - we've decoded everything
+          break;
+        }
+        
         audioDecoderRef.current.decode(chunk as EncodedAudioChunk);
-        decodedChunks++;
+        totalChunks++;
       }
-
-      // Don't call flush() during normal playback - it blocks and causes audio gaps
-      // Let the decoder output frames asynchronously via the output callback
+      
+      // Flush the decoder to ensure all samples are output
+      if (audioDecoderRef.current && audioDecoderRef.current.state !== "closed") {
+        await audioDecoderRef.current.flush();
+      }
+      
+      // Build the full audio buffer from accumulated samples
+      fullAudioBufferRef.current = buildFullAudioBuffer();
+      audioReadyRef.current = true;
+      
+      console.log(`Audio pre-decode complete: ${totalChunks} chunks, ${audioDecodedSamplesRef.current[0]?.length || 0} samples`);
     } catch (err) {
-      console.error("Error filling audio buffer:", err);
+      console.error("Error pre-decoding audio:", err);
     }
 
     audioFillInProgressRef.current = false;
-    // Removed setTimeout recursion - now using separate intervals via startBufferIntervals()
-  }, []);
+  }, [buildFullAudioBuffer]);
 
   const chooseFrame = useCallback((targetTimestamp: number): VideoFrame | null => {
     const buffer = frameBufferRef.current;
@@ -620,6 +665,7 @@ export function WebCodecsVideoPlayer({
   }, [updateState, updateDebugState]);
 
   // Start separate intervals for buffer filling (decoupled from render loop)
+  // SINGLE BUFFER AUDIO: No audio intervals needed - audio plays as one continuous buffer
   const startBufferIntervals = useCallback(() => {
     // Video buffer filling - more aggressive for smoother playback
     if (!videoFillIntervalRef.current) {
@@ -629,25 +675,8 @@ export function WebCodecsVideoPlayer({
         }
       }, VIDEO_FILL_INTERVAL);
     }
-    
-    // Audio buffer filling - more aggressive for smoother audio
-    if (!audioFillIntervalRef.current) {
-      audioFillIntervalRef.current = window.setInterval(() => {
-        if (isPlayingRef.current && !isCleanedUpRef.current) {
-          fillAudioBuffer();
-        }
-      }, AUDIO_FILL_INTERVAL);
-    }
-    
-    // Audio scheduling - more aggressive to prevent gaps
-    if (!audioScheduleIntervalRef.current) {
-      audioScheduleIntervalRef.current = window.setInterval(() => {
-        if (isPlayingRef.current && !isCleanedUpRef.current) {
-          scheduleAudioPlayback();
-        }
-      }, AUDIO_SCHEDULE_INTERVAL);
-    }
-  }, [fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback]);
+    // No audio intervals needed - audio is pre-decoded and plays as one continuous buffer
+  }, [fillFrameBuffer]);
 
   // Stop all buffer filling intervals
   const stopBufferIntervals = useCallback(() => {
@@ -655,14 +684,7 @@ export function WebCodecsVideoPlayer({
       clearInterval(videoFillIntervalRef.current);
       videoFillIntervalRef.current = null;
     }
-    if (audioFillIntervalRef.current) {
-      clearInterval(audioFillIntervalRef.current);
-      audioFillIntervalRef.current = null;
-    }
-    if (audioScheduleIntervalRef.current) {
-      clearInterval(audioScheduleIntervalRef.current);
-      audioScheduleIntervalRef.current = null;
-    }
+    // No audio intervals to stop - audio is handled by single AudioBufferSourceNode
   }, []);
 
   const play = useCallback(async () => {
@@ -675,19 +697,24 @@ export function WebCodecsVideoPlayer({
       await audioContextRef.current.resume();
     }
 
-    // Pre-fill buffers before starting playback for smooth start
-    // This is critical for preventing initial stuttering
+    // SINGLE BUFFER AUDIO: Pre-decode ALL audio before playback starts
+    // This ensures seamless audio with no gaps
+    if (!audioReadyRef.current && audioDecoderRef.current) {
+      console.log("Pre-decoding all audio...");
+      await preDecodeAllAudio();
+      console.log("Audio pre-decode complete, buffer ready:", !!fullAudioBufferRef.current);
+    }
+
+    // Pre-fill video buffers before starting playback for smooth start
     let bufferAttempts = 0;
     const maxBufferAttempts = 50; // Max 5 seconds of buffering (50 * 100ms)
     
     while (bufferAttempts < maxBufferAttempts) {
       await fillFrameBuffer();
-      await fillAudioBuffer();
       
       const hasEnoughFrames = frameBufferRef.current.length >= MIN_FRAMES_BEFORE_PLAY;
-      const hasEnoughAudio = audioBufferQueueRef.current.length >= MIN_AUDIO_BEFORE_PLAY || !audioDecoderRef.current;
       
-      if (hasEnoughFrames && hasEnoughAudio) {
+      if (hasEnoughFrames) {
         break;
       }
       
@@ -702,14 +729,11 @@ export function WebCodecsVideoPlayer({
     // Initialize A/V sync timing AFTER buffers are filled
     // audioStartTimeRef = current audioContext time when playback starts
     // mediaTimeOffsetRef = media timestamp (in seconds) that corresponds to audioStartTimeRef
+    const startOffset = mediaStartTimeRef.current / 1_000_000; // Convert microseconds to seconds
+    
     if (audioContextRef.current) {
       audioStartTimeRef.current = audioContextRef.current.currentTime;
-      // Initialize nextAudioTimeRef to current time - audio will start playing immediately
-      nextAudioTimeRef.current = audioContextRef.current.currentTime;
-      
-      // mediaStartTimeRef is in microseconds, convert to seconds for mediaTimeOffsetRef
-      // This represents the media position we're starting from
-      mediaTimeOffsetRef.current = mediaStartTimeRef.current / 1_000_000;
+      mediaTimeOffsetRef.current = startOffset;
       
       // If we have frames in the buffer, use the first frame's timestamp as the starting point
       // This ensures proper sync when the media doesn't start at timestamp 0
@@ -725,16 +749,19 @@ export function WebCodecsVideoPlayer({
     
     playbackStartTimeRef.current = performance.now();
     
-    // Schedule initial audio - this will start playing audio immediately
-    scheduleAudioPlayback();
+    // SINGLE BUFFER AUDIO: Start playing the full audio buffer from the current position
+    // This plays the ENTIRE audio as ONE continuous stream - no gaps!
+    if (fullAudioBufferRef.current) {
+      startAudioPlayback(mediaTimeOffsetRef.current);
+    }
 
-    // Start separate intervals for continuous buffer filling
+    // Start separate intervals for continuous video buffer filling
     startBufferIntervals();
 
     // Clear buffering state and start render loop
     updateState({ buffering: false });
     renderLoop();
-  }, [renderLoop, fillFrameBuffer, fillAudioBuffer, scheduleAudioPlayback, startBufferIntervals, updateState]);
+  }, [renderLoop, fillFrameBuffer, preDecodeAllAudio, startAudioPlayback, startBufferIntervals, updateState]);
 
   const pause = useCallback(() => {
     isPlayingRef.current = false;
@@ -757,10 +784,13 @@ export function WebCodecsVideoPlayer({
         (performance.now() - playbackStartTimeRef.current) * 1000;
     }
 
+    // SINGLE BUFFER AUDIO: Stop the audio source node
+    stopAudioPlayback();
+
     if (audioContextRef.current?.state === "running") {
       audioContextRef.current.suspend();
     }
-  }, [stopBufferIntervals, updateState]);
+  }, [stopBufferIntervals, stopAudioPlayback, updateState]);
 
   const togglePlayPause = useCallback(() => {
     if (state.isPlaying) {
@@ -784,10 +814,8 @@ export function WebCodecsVideoPlayer({
       }
       frameBufferRef.current = [];
 
-      for (const audioData of audioBufferQueueRef.current) {
-        audioData.close();
-      }
-      audioBufferQueueRef.current = [];
+      // SINGLE BUFFER AUDIO: No need to clear audio buffer queue
+      // The full audio buffer is already decoded and ready
 
       mediaStartTimeRef.current = newTime * 1_000_000;
       updateState({ currentTime: newTime });
@@ -795,8 +823,8 @@ export function WebCodecsVideoPlayer({
       // After seeking, we need to start with a keyframe
       needsKeyframeRef.current = true;
 
+      // Only seek video demuxer - audio is already fully decoded
       videoDemuxerRef.current?.seek(newTime);
-      audioDemuxerRef.current?.seek(newTime);
 
       fillFrameBuffer().then(() => {
         if (wasPlaying) {
